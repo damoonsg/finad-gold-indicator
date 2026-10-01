@@ -19,6 +19,8 @@ CACHE = {"time": 0, "data": None}
 CACHE_SECONDS = 25
 XAU_CACHE = {"time": 0, "data": None}
 XAU_CACHE_SECONDS = 60
+TREASURY_CACHE = {"time": 0, "data": None}
+TREASURY_CACHE_SECONDS = 60
 FED_CACHE = {"time": 0, "result": None}
 FED_CACHE_SECONDS = 300
 ECON_CACHE = {"time": 0, "result": None, "last_2y": None}
@@ -254,28 +256,243 @@ def yahoo_market(symbol):
 
 
 
-def treasury_yield_market(symbol):
-    """Fetch a Treasury yield quote and express the session move in basis points.
 
-    Yahoo yield-style symbols are quoted in percentage points, e.g. 4.42 means
-    4.42%. Therefore a move from 4.42 to 4.47 is +5 basis points.
+def _extract_marketwatch_yield(html):
+    """Best-effort parser for MarketWatch Treasury pages.
+
+    Returns (current_yield, previous_close). Both are percentage-point values,
+    e.g. 4.78 means 4.78%.
     """
-    data = yahoo_market(symbol)
+    soup = BeautifulSoup(html, "html.parser")
 
-    price = data.get("price")
-    previous = data.get("previous")
+    current = None
+    previous = None
 
-    change_bps = None
-    if price is not None and previous is not None:
+    # Current quote: MarketWatch commonly exposes the live number in bg-quote.
+    selectors = [
+        "bg-quote.value",
+        ".intraday__price bg-quote",
+        ".intraday__data bg-quote",
+        "bg-quote",
+    ]
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if not node:
+            continue
+        text = node.get_text(" ", strip=True)
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+        if m:
+            try:
+                value = float(m.group(1))
+                if 0 < value < 20:
+                    current = value
+                    break
+            except Exception:
+                pass
+
+    # Previous close from labelled key/value rows.
+    for label_node in soup.find_all(string=re.compile(r"Previous\s+Close", re.I)):
+        parent = label_node.parent
+        if parent:
+            container = parent.parent if parent.parent else parent
+            text = container.get_text(" ", strip=True)
+            m = re.search(r"Previous\s+Close\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+            if m:
+                try:
+                    value = float(m.group(1))
+                    if 0 < value < 20:
+                        previous = value
+                        break
+                except Exception:
+                    pass
+
+    # Regex fallbacks against full page text / HTML.
+    page_text = soup.get_text(" ", strip=True)
+
+    if current is None:
+        patterns = [
+            r"Yield\s*(?:\|\s*)?(?:As of|At close|Market Open)?[^0-9]{0,80}([0-9]+\.[0-9]+)\s*%",
+            r'"price"\s*:\s*"?(?:\$)?([0-9]+\.[0-9]+)',
+            r'"value"\s*:\s*"([0-9]+\.[0-9]+)"',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html, re.I | re.S) or re.search(pattern, page_text, re.I | re.S)
+            if m:
+                try:
+                    value = float(m.group(1))
+                    if 0 < value < 20:
+                        current = value
+                        break
+                except Exception:
+                    pass
+
+    if previous is None:
+        patterns = [
+            r"Previous\s+Close[^0-9]{0,40}([0-9]+\.[0-9]+)",
+            r"Prev(?:ious)?\s+Close[^0-9]{0,40}([0-9]+\.[0-9]+)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, page_text, re.I | re.S) or re.search(pattern, html, re.I | re.S)
+            if m:
+                try:
+                    value = float(m.group(1))
+                    if 0 < value < 20:
+                        previous = value
+                        break
+                except Exception:
+                    pass
+
+    return current, previous
+
+
+def _marketwatch_treasury_quote(tenor):
+    """Live Treasury yield + previous close from MarketWatch, no API key."""
+    slug_map = {
+        "2Y": "tmubmusd02y",
+        "10Y": "tmubmusd10y",
+        "30Y": "tmubmusd30y",
+    }
+    slug = slug_map[tenor]
+    url = f"https://www.marketwatch.com/investing/bond/{slug}?countrycode=bx"
+
+    headers = dict(HEADERS)
+    headers.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.marketwatch.com/",
+    })
+
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+
+    current, previous = _extract_marketwatch_yield(r.text)
+    if current is None or previous is None:
+        raise ValueError(f"Could not parse MarketWatch {tenor} yield")
+
+    change_bps = (current - previous) * 100.0
+
+    return {
+        "price": safe_round(current, 3),
+        "previous": safe_round(previous, 3),
+        "change": safe_round(current - previous, 3),
+        "change_pct": safe_round(((current - previous) / previous) * 100, 2) if previous else None,
+        "change_bps": safe_round(change_bps, 1),
+        "ok": True,
+        "source": "MarketWatch",
+        "tenor": tenor,
+    }
+
+
+def _fred_series_latest(series_id):
+    """Daily constant-maturity Treasury yield from FRED; no API key required."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    r = requests.get(url, headers=HEADERS, timeout=12)
+    r.raise_for_status()
+
+    rows = []
+    for raw in r.text.splitlines()[1:]:
+        parts = raw.strip().split(",")
+        if len(parts) < 2:
+            continue
+        date_str, value_str = parts[0].strip(), parts[1].strip()
+        if value_str in ("", "."):
+            continue
         try:
-            change_bps = (float(price) - float(previous)) * 100.0
+            rows.append((date_str, float(value_str)))
         except Exception:
-            change_bps = None
+            continue
 
-    data["change_bps"] = safe_round(change_bps, 1)
-    return data
+    if len(rows) < 2:
+        raise ValueError(f"Not enough FRED data for {series_id}")
+
+    current_date, current = rows[-1]
+    previous_date, previous = rows[-2]
+    return current, previous, current_date, previous_date
+
+
+def _fred_treasury_curve():
+    series_map = {
+        "2Y": "DGS2",
+        "10Y": "DGS10",
+        "30Y": "DGS30",
+    }
+    curve = {}
+
+    for tenor, series_id in series_map.items():
+        current, previous, current_date, previous_date = _fred_series_latest(series_id)
+        curve[tenor] = {
+            "price": safe_round(current, 3),
+            "previous": safe_round(previous, 3),
+            "change": safe_round(current - previous, 3),
+            "change_pct": safe_round(((current - previous) / previous) * 100, 2) if previous else None,
+            "change_bps": safe_round((current - previous) * 100.0, 1),
+            "ok": True,
+            "source": "FRED Daily",
+            "tenor": tenor,
+            "as_of": current_date,
+            "previous_as_of": previous_date,
+        }
+
+    return curve
+
+
+def treasury_spot_curve():
+    """Return 2Y/10Y/30Y *spot yields* from one consistent source.
+
+    Primary source is MarketWatch, which provides current Treasury yields and
+    previous closes for all three maturities. If any tenor cannot be fetched,
+    the entire curve falls back to daily FRED constant-maturity yields, so the
+    three maturities are never mixed across incompatible sources.
+    """
+    now = time.time()
+
+    if (
+        TREASURY_CACHE["data"] is not None
+        and now - TREASURY_CACHE["time"] < TREASURY_CACHE_SECONDS
+    ):
+        return TREASURY_CACHE["data"]
+
+    curve = None
+
+    try:
+        live_curve = {
+            "2Y": _marketwatch_treasury_quote("2Y"),
+            "10Y": _marketwatch_treasury_quote("10Y"),
+            "30Y": _marketwatch_treasury_quote("30Y"),
+        }
+        if all(live_curve[x].get("ok") for x in ("2Y", "10Y", "30Y")):
+            curve = live_curve
+    except Exception:
+        curve = None
+
+    if curve is None:
+        try:
+            curve = _fred_treasury_curve()
+        except Exception:
+            curve = {
+                "2Y": {
+                    "price": None, "previous": None, "change": None,
+                    "change_pct": None, "change_bps": None, "ok": False,
+                    "source": "Unavailable", "tenor": "2Y",
+                },
+                "10Y": {
+                    "price": None, "previous": None, "change": None,
+                    "change_pct": None, "change_bps": None, "ok": False,
+                    "source": "Unavailable", "tenor": "10Y",
+                },
+                "30Y": {
+                    "price": None, "previous": None, "change": None,
+                    "change_pct": None, "change_bps": None, "ok": False,
+                    "source": "Unavailable", "tenor": "30Y",
+                },
+            }
+
+    TREASURY_CACHE["time"] = now
+    TREASURY_CACHE["data"] = curve
+    return curve
+
 
 def xau_spot_market():
+
     """Fetch live XAU/USD spot from XAUS.com (free, no API key).
 
     The live spot price comes from /api/v1/spot. Daily change is calculated
@@ -1426,12 +1643,14 @@ def build_dashboard_data():
     now = time.time()
     if CACHE["data"] is not None and now - CACHE["time"] < CACHE_SECONDS:
         return CACHE["data"]
+    treasury_curve = treasury_spot_curve()
+
     markets = {
         "gold": xau_spot_market(),
         "dxy": yahoo_market("DX-Y.NYB"),
-        "us2y": treasury_yield_market("2YY=F"),
-        "us10y": treasury_yield_market("^TNX"),
-        "us30y": treasury_yield_market("^TYX"),
+        "us2y": treasury_curve["2Y"],
+        "us10y": treasury_curve["10Y"],
+        "us30y": treasury_curve["30Y"],
         "oil": yahoo_market("CL=F"),
         "vix": yahoo_market("^VIX"),
     }
@@ -1499,7 +1718,7 @@ def dashboard():
 <div class="component"><div class="component-name">US 30Y Move</div><div class="component-score">{{ data.rates.us30y_bps if data.rates.us30y_bps is not none else 'N/A' }} <span style="font-size:14px;color:#697282">bp</span></div></div>
 <div class="component"><div class="component-name">Weighted Yield Move</div><div class="component-score">{{ data.rates.weighted_bps }} <span style="font-size:14px;color:#697282">bp</span></div></div>
 </div>
-<div class="panel" style="margin-top:12px"><div class="news-title">Rates Regime</div><div class="note"><strong>{{ data.rates.regime }}</strong> • Weighting: 2Y 50% / 10Y 35% / 30Y 15%. Positive bps means yields are rising and is a headwind for gold.</div></div>
+<div class="panel" style="margin-top:12px"><div class="news-title">Rates Regime</div><div class="note"><strong>{{ data.rates.regime }}</strong> • Weighting: 2Y 50% / 10Y 35% / 30Y 15%. Positive bps means yields are rising and is a headwind for gold.</div><div class="note">Treasury source: <strong>{{ data.markets.us2y.source or "Unknown" }}</strong></div></div>
 
 <div class="section-title">Gold Score Components</div><div class="components">{% for name,value in data.components.items() %}<div class="component"><div class="component-name">{{ name }}</div><div class="component-score">{{ value }} <span style="font-size:14px;color:#697282">/100</span></div></div>{% endfor %}</div>
 
@@ -1520,7 +1739,7 @@ def dashboard():
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. Economic 2Y confirmation also uses basis points.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses spot Treasury yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. Primary source: MarketWatch; all three tenors fall back together to FRED daily if live parsing is unavailable. Economic 2Y confirmation also uses basis points.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
 </div><script>setTimeout(function(){window.location.reload();},30000);</script></body></html>
 '''
     return render_template_string(html, data=data)
