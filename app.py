@@ -35,9 +35,9 @@ FED_MAX_DOCUMENTS = 12
 FED_DOC_CHAR_LIMIT = 1800
 FED_MAX_DOCS_PER_SPEAKER = 2
 
-# Official Federal Reserve System sources only for Fed stance analysis.
-# UtoTimes/UtoFX remain available in the separate live-news/economic sections,
-# but they never feed the Federal Reserve score.
+# Hybrid Fed stance sources: official Federal Reserve System sites are primary;
+# UtoTimes/UtoFX are secondary for timely same-day quotes/Q&A when official text
+# is not yet published. Official sources win on overlapping episodes.
 OFFICIAL_REGIONAL_FED_SOURCES = {
     # Current 2026 voting Reserve Bank presidents. Board members are collected
     # directly from federalreserve.gov below.
@@ -59,6 +59,14 @@ REFRESH_STATE = {"running": False, "last_error": None, "started": 0}
 FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 UTOTIMES_FEEDS = [
     "https://utotimes.com/category/news/eco-dada/feed/",
+    "https://utotimes.com/feed/",
+]
+
+# Dedicated Fed/central-bank discovery. The general UtoTimes feed can move a Fed
+# story out of the newest items quickly, so the Fed engine also watches the
+# central-banks category directly.
+UTOTIMES_FED_FEEDS = [
+    "https://utotimes.com/category/news/centralbanks/feed/",
     "https://utotimes.com/feed/",
 ]
 
@@ -757,6 +765,51 @@ def parse_rss_items(url, limit=20):
 def get_utotimes_news(limit=8):
     items = parse_rss_items("https://utotimes.com/feed/", limit=max(limit, 12))
     return items[:limit]
+
+
+def get_utotimes_fed_news(limit=24):
+    """Collect recent Fed-speaker items from UtoTimes, independent of Live News.
+
+    The normal homepage RSS can be crowded by non-Fed headlines within minutes.
+    For the Fed engine we therefore read the UtoTimes central-banks category feed
+    plus the general feed, then keep only items that identify one of our Fed
+    speakers in a strict Federal Reserve context.
+    """
+    items = []
+    seen = set()
+    for feed_url in UTOTIMES_FED_FEEDS:
+        for item in parse_rss_items(feed_url, limit=max(limit, 36)):
+            link = item.get("link")
+            if link and link in seen:
+                continue
+
+            body = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
+            combined = f"{item.get('title','')} {body}".strip()
+            speaker = detect_speaker(combined, official_source=False)
+            if not speaker or not has_strict_fed_context(combined):
+                continue
+
+            # If RSS only carries a teaser, fetch the article so the semantic
+            # model sees the actual quote/context rather than just a headline.
+            page_date = None
+            if len(body) < 450 and link:
+                page_text, page_date = fetch_page(link)
+                if page_text:
+                    body = page_text
+                    combined = f"{item.get('title','')} {body}".strip()
+
+            if link:
+                seen.add(link)
+            items.append({
+                "source": "UtoTimes",
+                "title": item.get("title", ""),
+                "text": combined,
+                "date": item.get("date") or page_date,
+                "link": link,
+            })
+            if len(items) >= limit:
+                return items
+    return items
 
 
 def fetch_page(url):
@@ -1563,9 +1616,29 @@ def get_fed_monitor(telegram_news, utotimes_news):
         if doc:
             documents.append(doc)
 
-    for item in utotimes_news:
-        body = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
-        text = f"{item.get('title','')} {body}"
+    # Dedicated UtoTimes Fed discovery. This is intentionally separate from the
+    # 5-item Live News panel, so a Kashkari/Jefferson/etc. story is not lost just
+    # because several unrelated headlines were published afterward.
+    fed_uto_items = get_utotimes_fed_news(24)
+
+    # Also keep the already-fetched general UtoTimes items as a fallback, then
+    # de-duplicate by link before turning them into Fed documents.
+    combined_uto = []
+    uto_seen = set()
+    for item in fed_uto_items + list(utotimes_news or []):
+        link = item.get("link")
+        key = link or (item.get("title"), item.get("date"))
+        if key in uto_seen:
+            continue
+        uto_seen.add(key)
+        combined_uto.append(item)
+
+    for item in combined_uto:
+        if item.get("text") and item.get("source") == "UtoTimes":
+            text = item.get("text", "")
+        else:
+            body = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
+            text = f"{item.get('title','')} {body}"
         doc = _fed_raw_document(
             text, source="UtoTimes", date=item.get("date"),
             title=item.get("title", ""), link=item.get("link"),
@@ -1575,6 +1648,10 @@ def get_fed_monitor(telegram_news, utotimes_news):
             documents.append(doc)
 
     documents = dedupe_fed_documents(documents)
+    # Diagnostics before the final candidate cap. These counts make it obvious
+    # whether a missing speaker failed at source collection or at semantic filtering.
+    discovered_official_count = sum(1 for d in documents if d.get("official_source"))
+    discovered_uto_count = sum(1 for d in documents if not d.get("official_source"))
     # Keep up to several recent documents PER SPEAKER. This prevents a cluster of
     # non-policy speeches from crowding out an older, still-recent policy statement.
     # The AI then rejects irrelevant documents and the latest relevant one per
@@ -1593,7 +1670,10 @@ def get_fed_monitor(telegram_news, utotimes_news):
 
     fingerprint = _fed_documents_fingerprint(documents)
     if FED_AI_CACHE.get("fingerprint") == fingerprint and FED_AI_CACHE.get("result"):
-        result = FED_AI_CACHE["result"]
+        result = dict(FED_AI_CACHE["result"])
+        result["official_discovered"] = discovered_official_count
+        result["uto_discovered"] = discovered_uto_count
+        result["uto_fed_items"] = len(fed_uto_items)
         FED_CACHE["time"] = now
         FED_CACHE["result"] = result
         return result
@@ -1601,6 +1681,9 @@ def get_fed_monitor(telegram_news, utotimes_news):
     try:
         analyses = _groq_semantic_fed_analysis(documents)
         result = _build_semantic_fed_result(documents, analyses)
+        result["official_discovered"] = discovered_official_count
+        result["uto_discovered"] = discovered_uto_count
+        result["uto_fed_items"] = len(fed_uto_items)
         FED_AI_CACHE["fingerprint"] = fingerprint
         FED_AI_CACHE["result"] = result
         FED_AI_CACHE["time"] = now
@@ -2594,7 +2677,7 @@ def dashboard():
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <span class="note"> • {{ data.fed.event_count }} latest policy stances{% if data.fed.candidate_count is defined %} from {{ data.fed.candidate_count }} recent candidate documents{% endif %} • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
-{% if data.fed.analyzed_count is defined %}<div class="note">Official candidates sent to AI: <strong>{{ data.fed.candidate_count }}</strong> • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong></div>{% endif %}
+{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidates sent to AI: <strong>{{ data.fed.candidate_count }}</strong> • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
 {% if data.fed.error %}<div class="note" style="color:#e6a36f">Fed engine detail: {{ data.fed.error }}</div>{% endif %}
 <div class="note">Source policy: <strong>Official Federal Reserve System sources are primary</strong>; UtoFX/UtoTimes are secondary for timely quotes/Q&amp;A. If sources conflict, the official Fed source wins.</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
