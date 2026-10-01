@@ -41,7 +41,8 @@ GEO_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
 GEO_MAX_CANDIDATES = 15
 GEO_MAX_EVENTS = 8
 TRUMP_TRUTH_ACCOUNT_ID = "107780257626128497"
-GEO_GROQ_MODEL = os.environ.get("GEO_GROQ_MODEL", GROQ_MODEL)
+GEO_GROQ_MODEL = os.environ.get("GEO_GROQ_MODEL", "openai/gpt-oss-20b")
+GEO_GROQ_FALLBACK_MODEL = os.environ.get("GEO_GROQ_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 
 # Hybrid Fed stance sources: official Federal Reserve System sites are primary;
 # UtoTimes/UtoFX are secondary for timely same-day quotes/Q&A when official text
@@ -2780,85 +2781,107 @@ def _geo_fingerprint(items):
 
 
 def _groq_geopolitical_analysis(candidates):
+    """Semantic global-risk analysis on a model pool separate from the Fed model.
+
+    The Fed engine uses gpt-oss-120b. The geopolitical engine deliberately uses
+    gpt-oss-20b first so the two engines do not compete for the same free-plan
+    per-model TPM bucket. If 20b is temporarily unavailable/rejected, Qwen 3.8
+    27B is used as a second independent model. We never fall back to the Fed
+    120b model here, because doing so can immediately trigger the same 429 that
+    the dashboard just observed.
+    """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not configured")
 
-    docs=[]
-    for i,c in enumerate(candidates,1):
+    docs = []
+    for i, c in enumerate(candidates[:GEO_MAX_CANDIDATES], 1):
         docs.append({
-            "id": i, "date": c.get("date"), "source": c.get("source"),
-            "source_type": c.get("source_type"), "credibility": round(float(c.get("credibility",0.68)),2),
-            "headline_or_text": (c.get("text") or "")[:850],
+            "id": i,
+            "date": c.get("date"),
+            "source": c.get("source"),
+            "source_type": c.get("source_type"),
+            "credibility": round(float(c.get("credibility", 0.68)), 2),
+            # Keep the request comfortably inside the free-tier TPM budget.
+            "headline_or_text": (c.get("text") or "")[:620],
         })
 
     system_prompt = """You are a global geopolitical-risk analyst for a GOLD macro dashboard.
-Read the supplied items semantically. Do NOT score by keyword counts. The task is to identify DISTINCT current geopolitical events worldwide that can matter to gold, the U.S. dollar, rates, oil, or global risk appetite.
+Read meaning and context, not keyword counts. Identify DISTINCT CURRENT events worldwide that can materially affect gold, USD, rates, oil, shipping, or global risk appetite.
 
-Coverage is GLOBAL: Middle East, Russia/Ukraine, Europe/NATO, China/Taiwan/South China Sea, Koreas, India/Pakistan, trade wars/tariffs/export controls, sanctions, nuclear risks, shipping chokepoints, terrorism/security, coups/major instability, and major diplomatic de-escalation.
+Global coverage includes Middle East, Russia/Ukraine, Europe/NATO, China/Taiwan/South China Sea, Koreas, India/Pakistan, sanctions, trade wars/tariffs/export controls, nuclear risk, shipping chokepoints, terrorism/security, coups/major instability, and major diplomatic de-escalation.
 
-Critical rules:
-1. MERGE duplicate reports of the same real-world event into one event. More sources increase confidence, not event count.
-2. Distinguish a STATEMENT/THREAT from PREPARATION and from a CONFIRMED_ACTION/ACTIVE_CONFLICT. A politician's post is evidence of what they said, not proof that an action happened.
-3. Direct Trump X/Truth posts are important public statements. If a claim of action is not independently supported by another supplied source, do not upgrade it to confirmed action solely because the post says it happened.
-4. Official/major-wire reporting has higher evidentiary value for confirming actions. Uto is useful secondary reporting.
-5. DE-ESCALATION (ceasefire, credible negotiations, withdrawal, sanctions relief, peace agreement) must receive negative direction for gold geopolitical risk when materially important.
-6. Ignore routine domestic politics, ordinary crime, sports, culture, or items with negligible global gold relevance.
-7. Evaluate current market relevance, not moral importance.
+Rules:
+1) Merge duplicate reports of the same event. More independent sources raise confidence, not event count.
+2) Separate STATEMENT/THREAT from PREPARATION and CONFIRMED_ACTION/ACTIVE_CONFLICT.
+3) A Trump X/Truth post proves what was said, not that an action occurred; require independent support to upgrade an action claim.
+4) Major wires/official sources have more evidentiary weight for confirmed actions; Uto is secondary.
+5) Material ceasefire, credible negotiations, withdrawal, sanctions relief, or peace agreements are DE_ESCALATION.
+6) Ignore ordinary domestic politics/crime/culture with negligible global gold relevance.
+7) Score current market relevance, not moral importance.
 
-For each distinct event return:
-- event_key: short unique label
-- summary: concise factual 1-2 sentence summary
-- region: short region/country pair
-- category: one of MILITARY, NUCLEAR, SANCTIONS, TRADE, SHIPPING, TERROR_SECURITY, POLITICAL_INSTABILITY, DIPLOMACY, ENERGY_SECURITY, OTHER
-- direction: ESCALATION, DE_ESCALATION, or NEUTRAL
-- stage: STATEMENT, THREAT, PREPARATION, CONFIRMED_ACTION, ACTIVE_CONFLICT, DIPLOMATIC_ACTION, CEASEFIRE_DEAL, SANCTIONS_ACTION, TRADE_ACTION
-- severity: 0-100
-- gold_relevance: 0-100
-- oil_relevance: 0-100
-- confidence: 0-100
-- input_ids: list of supplied document IDs supporting the event
+Return ONLY JSON in exactly this shape:
+{"events":[{"event_key":"short label","summary":"1-2 concise factual sentences","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":0,"gold_relevance":0,"oil_relevance":0,"confidence":0,"input_ids":[1]}]}.
+Return at most 8 events. Do not invent facts beyond supplied items."""
 
-Return ONLY valid JSON: {"events":[...]}.
-Return at most 8 events, prioritizing gold relevance and recency. Do not invent facts beyond the supplied items."""
-
-    base_payload={
-        "messages":[
-            {"role":"system","content":system_prompt},
-            {"role":"user","content":json.dumps({"items":docs},ensure_ascii=False)},
+    base_payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps({"items": docs}, ensure_ascii=False)},
         ],
-        "temperature":0.1,
-        "max_tokens":1500,
-        "response_format":{"type":"json_object"},
+        "temperature": 0.1,
+        "max_tokens": 1050,
     }
-    headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    # Use the same proven model as the Fed engine by default. If a custom Geo
-    # model is configured and Groq rejects it with a 4xx, retry once with the
-    # working Fed model instead of neutralizing the whole geopolitical engine.
-    models=[GEO_GROQ_MODEL]
-    if GROQ_MODEL not in models:
-        models.append(GROQ_MODEL)
-    errors=[]
+    models = []
+    for model in (GEO_GROQ_MODEL, GEO_GROQ_FALLBACK_MODEL):
+        if model and model not in models and model != GROQ_MODEL:
+            models.append(model)
+    # Safety: even if a Render env var accidentally points GEO_GROQ_MODEL at
+    # the Fed 120b model, restore the intended independent Geo model pool.
+    if not models:
+        models = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+
+    errors = []
     for model in models:
-        payload=dict(base_payload)
-        payload["model"]=model
-        try:
-            r=requests.post(GROQ_API_URL,headers=headers,json=payload,timeout=(5,25))
-            if r.status_code == 429:
-                raise RuntimeError(f"GROQ RATE LIMIT on {model}")
-            if r.status_code >= 400:
-                detail=(r.text or "").replace("\n"," ")[:420]
-                raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
-            parsed=_parse_json_object(r.json()["choices"][0]["message"]["content"])
-            events=parsed.get("events")
-            if not isinstance(events,list):
-                raise ValueError("Geo AI response missing events array")
-            return events[:GEO_MAX_EVENTS]
-        except Exception as exc:
-            errors.append(str(exc))
-    raise RuntimeError(" | ".join(errors)[-900:])
+        # First try JSON mode. If Groq rejects that request with 400 for any
+        # model-specific reason, retry once without response_format; our parser
+        # already extracts a JSON object safely from plain model output.
+        for use_json_mode in (True, False):
+            payload = dict(base_payload)
+            payload["model"] = model
+            if model.startswith("openai/gpt-oss-"):
+                payload["reasoning_effort"] = "low"
+            if use_json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            try:
+                r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 25))
+                if r.status_code == 429:
+                    retry_after = r.headers.get("retry-after", "unknown")
+                    errors.append(f"GROQ RATE LIMIT on {model} (retry-after {retry_after}s)")
+                    # A retry on the same model cannot help while its TPM bucket
+                    # is exhausted; immediately move to the independent model.
+                    break
+                if r.status_code >= 400:
+                    detail = (r.text or "").replace("\n", " ")[:420]
+                    errors.append(f"GROQ HTTP {r.status_code} on {model}: {detail}")
+                    if r.status_code == 400 and use_json_mode:
+                        continue
+                    break
 
+                parsed = _parse_json_object(r.json()["choices"][0]["message"]["content"])
+                events = parsed.get("events")
+                if not isinstance(events, list):
+                    raise ValueError("Geo AI response missing events array")
+                return events[:GEO_MAX_EVENTS]
+            except Exception as exc:
+                errors.append(str(exc))
+                if use_json_mode:
+                    continue
+                break
+
+    raise RuntimeError(" | ".join(errors)[-1100:])
 
 def _score_geopolitical_events(candidates, ai_events):
     by_id={i+1:c for i,c in enumerate(candidates)}
@@ -2989,6 +3012,7 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
         ai_events=_groq_geopolitical_analysis(candidates)
         result=_score_geopolitical_events(candidates,ai_events)
         result["status"]="OK"
+        result["ai_model"]=f"{GEO_GROQ_MODEL} → {GEO_GROQ_FALLBACK_MODEL}"
         result["source_stats"]=source_stats
         result["candidate_count"]=len(candidates)
         result["ai_event_count"]=len(ai_events)
@@ -3001,7 +3025,8 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
             result={
                 "score":50.0,"regime":"AI TEMPORARILY UNAVAILABLE","events":[],"event_count":0,
                 "escalating":0,"deescalating":0,"net_impact":0.0,"status":"AI TEMPORARILY UNAVAILABLE",
-                "error":str(exc)[:220],"source_stats":source_stats,
+                "error":str(exc)[:420],"source_stats":source_stats,
+                "ai_model":f"{GEO_GROQ_MODEL} → {GEO_GROQ_FALLBACK_MODEL}",
             }
 
     GEO_CACHE["time"]=now; GEO_CACHE["result"]=result
@@ -3332,7 +3357,7 @@ def dashboard():
 </div>
 <div class="panel" style="margin-top:12px;margin-bottom:12px">
 <div class="news-title">{{ data.geopolitical.regime }}</div>
-<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates analyzed: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong></div>
+<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates analyzed: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong> • Geo AI: <strong>{{ data.geopolitical.ai_model|default("20b/qwen fallback") }}</strong></div>
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
 </div>
 <div class="fed-grid">
