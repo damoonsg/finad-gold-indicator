@@ -31,10 +31,28 @@ FED_CACHE_SECONDS = 300
 FED_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-FED_MAX_DOCUMENTS = 18
+FED_MAX_DOCUMENTS = 30
 FED_DOC_CHAR_LIMIT = 2600
 FED_AI_BATCH_SIZE = 6
 FED_MAX_DOCS_PER_SPEAKER = 3
+
+# Official Federal Reserve System sources only for Fed stance analysis.
+# UtoTimes/UtoFX remain available in the separate live-news/economic sections,
+# but they never feed the Federal Reserve score.
+OFFICIAL_REGIONAL_FED_SOURCES = {
+    "John Williams": {"source": "New York Fed", "archive": "https://www.newyorkfed.org/newsevents/speeches/index", "domain": "newyorkfed.org"},
+    "Neel Kashkari": {"source": "Minneapolis Fed", "archive": "https://www.minneapolisfed.org/topic/monetary-policy", "domain": "minneapolisfed.org"},
+    "Lorie Logan": {"source": "Dallas Fed", "archive": "https://www.dallasfed.org/news/speeches/logan", "domain": "dallasfed.org"},
+    "Austan Goolsbee": {"source": "Chicago Fed", "archive": "https://www.chicagofed.org/utilities/about-us/office-of-the-president/office-of-the-president-speaking", "domain": "chicagofed.org"},
+    "Thomas Barkin": {"source": "Richmond Fed", "archive": "https://www.richmondfed.org/press_room/speeches/thomas_i_barkin/2026", "domain": "richmondfed.org"},
+    "Susan Collins": {"source": "Boston Fed", "archive": "https://www.bostonfed.org/news-and-events/speeches.aspx", "domain": "bostonfed.org"},
+    "Beth Hammack": {"source": "Cleveland Fed", "archive": "https://www.clevelandfed.org/president-and-ceo/", "domain": "clevelandfed.org"},
+    "Anna Paulson": {"source": "Philadelphia Fed", "archive": "https://www.philadelphiafed.org/the-economy/speeches-anna-paulson", "domain": "philadelphiafed.org"},
+    "Alberto Musalem": {"source": "St. Louis Fed", "archive": "https://www.stlouisfed.org/from-the-president", "domain": "stlouisfed.org"},
+    "Jeffrey Schmid": {"source": "Kansas City Fed", "archive": "https://www.kansascityfed.org/office-of-the-president/", "domain": "kansascityfed.org"},
+    "Mary Daly": {"source": "San Francisco Fed", "archive": "https://www.frbsf.org/news-and-media/speeches/", "domain": "frbsf.org"},
+}
+
 ECON_CACHE = {"time": 0, "result": None, "last_2y": None}
 ECON_CACHE_SECONDS = 300
 
@@ -899,6 +917,225 @@ def get_williams_speech_documents(limit=12):
     return items
 
 
+
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _visible_date(text):
+    """Best-effort parser for dates printed on official Fed archive/detail pages."""
+    if not text:
+        return None
+    t = normalize_digits(str(text))
+    # ISO / numeric date first.
+    for pat in [r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b"]:
+        m = re.search(pat, t)
+        if m:
+            try:
+                if pat.startswith(r"\b(20"):
+                    y, mo, d = map(int, m.groups())
+                else:
+                    mo, d, y = map(int, m.groups())
+                return datetime(y, mo, d, 12, 0, tzinfo=timezone.utc).isoformat()
+            except Exception:
+                pass
+    # Month-name dates: September 30, 2026 / Sept. 30, 2026
+    m = re.search(r"\b(January|February|March|April|May|June|July|August|September|Sept\.?|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Oct\.?|Nov\.?|Dec\.?)\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(20\d{2})\b", t, re.I)
+    if m:
+        key = m.group(1).lower().replace('.', '')
+        try:
+            return datetime(int(m.group(3)), MONTHS[key], int(m.group(2)), 12, 0, tzinfo=timezone.utc).isoformat()
+        except Exception:
+            pass
+    # Federal Reserve archive style: 10/1/2026 is already handled above.
+    return None
+
+
+def _official_doc_for_speaker(speaker, text, source, date=None, title=None, link=None):
+    """Create a document from a speaker-specific official Federal Reserve page."""
+    if not text or not speaker:
+        return None
+    date = date or _visible_date(text)
+    if fed_recency_weight(date) <= 0:
+        return None
+    clean_text = re.sub(r"\s+", " ", str(text)).strip()
+    return {
+        "speaker": speaker,
+        "source": source,
+        "date": date,
+        "title": (title or clean_text[:180]).strip(),
+        "link": link,
+        "text": clean_text,
+        "voter": speaker in FOMC_VOTERS_2026,
+        "official_source": True,
+    }
+
+
+def _is_same_official_domain(url, domain):
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+        return host == domain or host.endswith("." + domain)
+    except Exception:
+        return False
+
+
+def _archive_recent_links(speaker, config, limit=8):
+    """Discover recent detail links from a speaker-specific official Fed archive page."""
+    try:
+        r = requests.get(config["archive"], headers=HEADERS, timeout=(3, 8))
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return []
+
+    found = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = urljoin(config["archive"], a.get("href", ""))
+        if not href or href in seen or not _is_same_official_domain(href, config["domain"]):
+            continue
+        if href.lower().endswith((".pdf", ".jpg", ".jpeg", ".png", ".zip")):
+            continue
+        label = " ".join(a.stripped_strings).strip()
+        if not label:
+            continue
+
+        # Pull a little surrounding text because most official archive pages print
+        # the publication date beside the link rather than inside the anchor.
+        context = label
+        node = a
+        for _ in range(3):
+            node = getattr(node, "parent", None)
+            if not node:
+                break
+            txt = " ".join(node.stripped_strings)
+            if txt:
+                context = txt[:1200]
+            if _visible_date(context):
+                break
+
+        date_hint = _visible_date(context)
+        path = href.lower()
+        combined = normalize_text(label + " " + context)
+        last = speaker.split()[-1].lower()
+        pathish = any(k in path for k in ("speech", "speeches", "remarks", "president", "/2026/", "policy"))
+        named = last in combined or normalize_text(speaker) in combined
+        recent = fed_recency_weight(date_hint) > 0 if date_hint else False
+
+        # Speaker-specific archive pages allow path-based discovery even when the
+        # speaker's name is omitted from a compact card. Unknown-date links are
+        # kept sparingly and verified on the detail page later.
+        if not pathish:
+            continue
+        if date_hint and not recent:
+            continue
+        if not named and "2026" not in path and not recent:
+            continue
+
+        seen.add(href)
+        found.append({"link": href, "title": label[:260], "date_hint": date_hint})
+
+    found.sort(key=lambda x: parse_date(x.get("date_hint")) or datetime(2000,1,1,tzinfo=timezone.utc), reverse=True)
+    # Keep recent dated links plus only a few unknown-date links for verification.
+    dated = [x for x in found if x.get("date_hint")]
+    unknown = [x for x in found if not x.get("date_hint")][:3]
+    return (dated + unknown)[:limit]
+
+
+def _fetch_official_regional_source(speaker, config):
+    docs = []
+    candidates = _archive_recent_links(speaker, config, limit=8)
+    if not candidates:
+        return docs
+
+    def load(candidate):
+        body, page_date = fetch_page(candidate["link"])
+        if not body:
+            return None
+        date = page_date or candidate.get("date_hint") or _visible_date(body[:3000])
+        return _official_doc_for_speaker(
+            speaker, body, config["source"], date=date,
+            title=candidate.get("title"), link=candidate.get("link"),
+        )
+
+    with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as pool:
+        futures = [pool.submit(load, c) for c in candidates]
+        for f in as_completed(futures):
+            try:
+                doc = f.result()
+                if doc:
+                    docs.append(doc)
+            except Exception:
+                pass
+    return docs
+
+
+def get_official_regional_fed_documents():
+    """Collect recent remarks from official Reserve Bank websites only."""
+    docs = []
+    # Williams is already covered by the New York Fed-specific parser below, which
+    # is more reliable than the generic archive crawler.
+    items = [(sp, cfg) for sp, cfg in OFFICIAL_REGIONAL_FED_SOURCES.items() if sp != "John Williams"]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_fetch_official_regional_source, sp, cfg): sp for sp, cfg in items}
+        for f in as_completed(futures):
+            try:
+                docs.extend(f.result() or [])
+            except Exception:
+                pass
+    return docs
+
+
+def get_board_yearpage_documents(limit=30):
+    """Second official Board source to reduce RSS lag for same-day speeches."""
+    url = "https://www.federalreserve.gov/newsevents/2026-speeches.htm"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=(3, 8))
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return []
+
+    candidates = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = urljoin(url, a.get("href", ""))
+        if "/newsevents/speech/" not in href or href in seen:
+            continue
+        seen.add(href)
+        label = " ".join(a.stripped_strings).strip()
+        context = " ".join((a.parent.parent if a.parent and a.parent.parent else a).stripped_strings)[:1600]
+        date_hint = _visible_date(context)
+        if date_hint and fed_recency_weight(date_hint) <= 0:
+            continue
+        candidates.append({"link": href, "title": label, "date_hint": date_hint})
+        if len(candidates) >= limit:
+            break
+
+    docs = []
+    def load(c):
+        body, page_date = fetch_page(c["link"])
+        date = page_date or c.get("date_hint") or _visible_date(body[:3000])
+        # Board pages carry the speaker name in the body, so entity detection is safe.
+        return _fed_raw_document(body, source="Federal Reserve", date=date,
+                                 title=c.get("title"), link=c.get("link"), official_source=True)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(load, c) for c in candidates]
+        for f in as_completed(futures):
+            try:
+                d = f.result()
+                if d:
+                    docs.append(d)
+            except Exception:
+                pass
+    return docs
+
+
 def _fed_document_similarity(a, b):
     if a.get("speaker") != b.get("speaker"):
         return 0.0
@@ -1190,8 +1427,9 @@ def _build_semantic_fed_result(documents, analyses):
         "event_count": len(events),
         "candidate_count": len(documents),
         "average_stance": round(avg_stance, 2),
-        "mode": "AI SEMANTIC",
+        "mode": "AI SEMANTIC • OFFICIAL FED SOURCES",
         "model": GROQ_MODEL,
+        "source_scope": "Federal Reserve System official websites only",
         "status": "OK",
     }
 
@@ -1201,28 +1439,13 @@ def get_fed_monitor(telegram_news, utotimes_news):
         return FED_CACHE["result"]
 
     documents = []
+    # Federal Reserve stance is built ONLY from official Federal Reserve System
+    # websites. News feeds remain visible elsewhere on the dashboard but never
+    # enter the Fed score.
     documents.extend(get_board_speech_documents(30))
+    documents.extend(get_board_yearpage_documents(30))
     documents.extend(get_williams_speech_documents(12))
-
-    for item in telegram_news:
-        doc = _fed_raw_document(
-            item.get("text", ""), source=item.get("source", "UtoFX Telegram"),
-            date=item.get("date"), title=item.get("text", "")[:220],
-            link=item.get("link"), official_source=False,
-        )
-        if doc:
-            documents.append(doc)
-
-    for item in utotimes_news:
-        # UtoTimes is secondary. Use title/content for context, but only when a
-        # real Fed speaker and strict Fed context are present.
-        text = f"{item.get('title','')} {BeautifulSoup(item.get('content') or '', 'html.parser').get_text(' ', strip=True)}"
-        doc = _fed_raw_document(
-            text, source="UtoTimes", date=item.get("date"),
-            title=item.get("title", ""), link=item.get("link"), official_source=False,
-        )
-        if doc:
-            documents.append(doc)
+    documents.extend(get_official_regional_fed_documents())
 
     documents = dedupe_fed_documents(documents)
     # Keep up to several recent documents PER SPEAKER. This prevents a cluster of
@@ -1234,8 +1457,8 @@ def get_fed_monitor(telegram_news, utotimes_news):
     if not documents:
         result = {
             "score": 50.0, "events": [], "event_count": 0,
-            "average_stance": 0.0, "mode": "AI SEMANTIC",
-            "model": GROQ_MODEL, "status": "NO RECENT DOCUMENTS",
+            "average_stance": 0.0, "mode": "AI SEMANTIC • OFFICIAL FED SOURCES",
+            "model": GROQ_MODEL, "source_scope": "Federal Reserve System official websites only", "status": "NO RECENT DOCUMENTS",
         }
         FED_CACHE["time"] = now
         FED_CACHE["result"] = result
@@ -1267,8 +1490,8 @@ def get_fed_monitor(telegram_news, utotimes_news):
                 "events": [],
                 "event_count": 0,
                 "average_stance": 0.0,
-                "mode": "AI SEMANTIC",
-                "model": GROQ_MODEL,
+                "mode": "AI SEMANTIC • OFFICIAL FED SOURCES",
+                "model": GROQ_MODEL, "source_scope": "Federal Reserve System official websites only",
                 "status": ("API KEY MISSING" if "GROQ_API_KEY" in str(exc) else "AI TEMPORARILY UNAVAILABLE"),
                 "error": str(exc)[:180],
             }
@@ -2242,6 +2465,7 @@ def dashboard():
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <span class="note"> • {{ data.fed.event_count }} latest policy stances{% if data.fed.candidate_count is defined %} from {{ data.fed.candidate_count }} recent candidate documents{% endif %} • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
+<div class="note">Source policy: <strong>Official Federal Reserve System websites only</strong>. UtoFX/UtoTimes do not affect the Fed score.</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
 </div>
 <div class="fed-grid">
