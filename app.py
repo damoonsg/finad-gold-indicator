@@ -32,7 +32,7 @@ FED_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 FED_MAX_DOCUMENTS = 12
-FED_DOC_CHAR_LIMIT = 1200
+FED_DOC_CHAR_LIMIT = 1800
 FED_MAX_DOCS_PER_SPEAKER = 2
 
 # Official Federal Reserve System sources only for Fed stance analysis.
@@ -1255,53 +1255,90 @@ POLICY_RELEVANCE_TERMS = [
     "restrictive", "neutral rate", "incoming data", "more data", "wait", "patience",
 ]
 
+# These terms are used ONLY to establish that an official speech is plainly about
+# monetary policy. They never determine hawkish/dovish direction or the score.
+# This prevents a semantic model from accidentally rejecting an obviously policy-
+# focused official speech such as "Economic Conditions and Monetary Policy".
+FORCE_POLICY_TITLE_TERMS = [
+    "monetary policy", "economic outlook", "u.s. economy", "us economy",
+    "dual mandate", "policy communication", "policy risks",
+    "outlook for the economy", "economic conditions", "policy framework",
+    "federal funds", "interest rates", "rate policy",
+]
+
+def _title_policy_relevance_hint(title):
+    t = normalize_text(title or "")
+    return any(term in t for term in FORCE_POLICY_TITLE_TERMS)
+
 
 def _policy_excerpt(text, title="", max_chars=FED_DOC_CHAR_LIMIT):
-    """Compact context for the semantic model without keyword SCORING.
+    """Build a compact but policy-complete excerpt for semantic analysis.
 
-    Terms are used only to find the parts of a long official speech that discuss
-    policy. The LLM still decides relevance and stance from meaning/context.
-    This keeps one Groq request under the free-plan token-per-minute limit.
+    This function does NOT score words. It only makes sure the LLM sees the
+    forward-guidance/conclusion passages that are often near the end of a long
+    official speech, instead of sending only the opening section.
     """
-    clean = re.sub(r"\\s+", " ", str(text or "")).strip()
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
     if not clean:
         return ""
+
     lower = clean.lower()
+    # Forward-looking policy language gets searched first because it is the most
+    # informative part of a Fed speech for the CURRENT stance.
+    priority_terms = [
+        "further policy adjustments", "current views on monetary policy",
+        "next policy move", "next rate", "policy rate", "federal funds",
+        "rate increase", "rate hike", "rate cut", "interest rates",
+        "monetary policy", "dual mandate", "inflation", "labor market",
+        "labour market", "economic outlook", "incoming data", "more data",
+    ]
+
     windows = []
-    for term in POLICY_RELEVANCE_TERMS:
+    for term in priority_terms:
         pos = 0
+        hits_for_term = 0
         while True:
             hit = lower.find(term, pos)
             if hit < 0:
                 break
-            windows.append((max(0, hit - 260), min(len(clean), hit + len(term) + 420)))
+            windows.append((max(0, hit - 300), min(len(clean), hit + len(term) + 520)))
             pos = hit + len(term)
-            if len(windows) >= 18:
+            hits_for_term += 1
+            if hits_for_term >= 3 or len(windows) >= 16:
                 break
-        if len(windows) >= 18:
+        if len(windows) >= 16:
             break
-
-    # No policy-looking passage: still give the model the title and a short lead
-    # so it can reject the item as irrelevant rather than silently losing it.
-    if not windows:
-        return (str(title or "") + " | " + clean[:max_chars]).strip()[:max_chars]
 
     windows.sort()
     merged = []
-    for a,b in windows:
-        if merged and a <= merged[-1][1] + 80:
+    for a, b in windows:
+        if merged and a <= merged[-1][1] + 100:
             merged[-1] = (merged[-1][0], max(merged[-1][1], b))
         else:
-            merged.append((a,b))
-    chunks=[]
-    for a,b in merged:
-        chunk=clean[a:b].strip()
-        if chunk and chunk not in chunks:
-            chunks.append(chunk)
-    excerpt = " ... ".join(chunks)
-    prefix = (str(title or "").strip() + " | ") if title else ""
-    return (prefix + excerpt)[:max_chars]
+            merged.append((a, b))
 
+    policy_chunks = []
+    for a, b in merged:
+        chunk = clean[a:b].strip()
+        if chunk and chunk not in policy_chunks:
+            policy_chunks.append(chunk)
+
+    title_part = str(title or "").strip()
+    lead = clean[:300].strip()
+    # Fed speakers very often state the actual policy conclusion near the end.
+    tail = clean[-650:].strip() if len(clean) > 650 else clean
+
+    core_parts = [x for x in [title_part, lead] + policy_chunks if x]
+    core = " | ".join(core_parts)
+    separator = " ... [CONCLUSION/TAIL] ... "
+
+    # Reserve room for the conclusion so it can never be truncated away.
+    tail_budget = min(650, max(300, max_chars // 3))
+    tail = tail[-tail_budget:]
+    core_budget = max(0, max_chars - len(separator) - len(tail))
+    core = core[:core_budget]
+    excerpt = (core + separator + tail).strip()
+    return excerpt[:max_chars]
 
 def _groq_semantic_fed_analysis(documents):
     """One compact semantic request for the current official Fed documents.
@@ -1316,7 +1353,7 @@ def _groq_semantic_fed_analysis(documents):
 
     system_prompt = """You are a monetary-policy research analyst. Analyze Federal Reserve communications by meaning and policy intent, not keyword counts.
 
-Every supplied item comes from an official Federal Reserve System website. The text may be a compact excerpt from a longer official speech. Read context and meaning; never score by word frequency.
+Items may come from either (1) official Federal Reserve System websites or (2) UtoFX/UtoTimes as secondary reporting. Official Federal Reserve sources are authoritative and must be preferred when there is any conflict. Uto sources can be used for timely quotes/Q&A when an official transcript is not yet available. The text may be a compact excerpt. Read context and meaning; never score by word frequency.
 
 For each item:
 - decide whether it materially communicates the speaker's CURRENT monetary-policy stance;
@@ -1326,6 +1363,7 @@ For each item:
 - inflation concern alone does not automatically make the overall stance hawkish;
 - patience / more time / more data / no urgency generally pulls the overall stance toward neutral unless another near-term hike is clearly advocated;
 - if the item is about data systems, regulation, cybersecurity, community issues, or another topic without meaningful policy guidance, set policy_relevant=false.
+- if policy_relevant_hint=true, the OFFICIAL TITLE itself clearly identifies a monetary-policy/economic-outlook speech. Treat it as policy_relevant unless the supplied text is obviously a parser mismatch. Do not reject it merely because the excerpt is compact.
 
 stance_score scale:
 -2.0 strongly dovish
@@ -1349,7 +1387,9 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
             "speaker": doc.get("speaker"),
             "date": doc.get("date"),
             "source": doc.get("source"),
+            "official_source": bool(doc.get("official_source")),
             "title": doc.get("title"),
+            "policy_relevant_hint": _title_policy_relevance_hint(doc.get("title") or ""),
             "text": _policy_excerpt(doc.get("text") or "", doc.get("title") or ""),
         })
 
@@ -1395,7 +1435,11 @@ def _build_semantic_fed_result(documents, analyses):
         policy_relevant = a.get("policy_relevant", True)
         if isinstance(policy_relevant, str):
             policy_relevant = policy_relevant.strip().lower() in ("true", "1", "yes")
-        if not policy_relevant:
+        # Official titles such as "Economic Conditions and Monetary Policy" are
+        # unambiguously policy-relevant. AI still decides the STANCE; the title
+        # hint only prevents an erroneous relevance rejection.
+        forced_relevant = _title_policy_relevance_hint(doc.get("title") or "")
+        if not policy_relevant and not forced_relevant:
             continue
 
         try:
@@ -1415,7 +1459,27 @@ def _build_semantic_fed_result(documents, analyses):
         dt = parse_date(doc.get("date"))
         if not speaker or not dt:
             continue
-        if speaker not in latest or dt > parse_date(latest[speaker][0].get("date")):
+        if speaker not in latest:
+            latest[speaker] = (doc, a, stance, confidence)
+            continue
+
+        old_doc = latest[speaker][0]
+        old_dt = parse_date(old_doc.get("date"))
+        if not old_dt:
+            latest[speaker] = (doc, a, stance, confidence)
+            continue
+
+        # If official and Uto items are effectively about the same recent episode,
+        # prefer the official Federal Reserve source. Otherwise use the newer
+        # policy-relevant statement, allowing Uto to fill a same-day transcript gap.
+        hours_apart = abs((dt - old_dt).total_seconds()) / 3600.0
+        new_official = bool(doc.get("official_source"))
+        old_official = bool(old_doc.get("official_source"))
+        if hours_apart <= 12 and new_official != old_official:
+            if new_official:
+                latest[speaker] = (doc, a, stance, confidence)
+            continue
+        if dt > old_dt:
             latest[speaker] = (doc, a, stance, confidence)
 
     events = []
@@ -1445,6 +1509,7 @@ def _build_semantic_fed_result(documents, analyses):
             "confidence": round(confidence, 0),
             "gold_impact": round(gold_impact, 2),
             "source": doc.get("source"),
+            "source_type": "OFFICIAL FED" if doc.get("official_source") else "UTO SECONDARY",
             "date": doc.get("date"),
             "title": doc.get("title"),
             "link": doc.get("link"),
@@ -1465,10 +1530,12 @@ def _build_semantic_fed_result(documents, analyses):
         "event_count": len(events),
         "candidate_count": len(documents),
         "analyzed_count": len(analyses),
+        "relevant_count": len(candidates),
+        "rejected_count": max(0, len(documents) - len(candidates)),
         "average_stance": round(avg_stance, 2),
-        "mode": "AI SEMANTIC • OFFICIAL FED SOURCES",
+        "mode": "AI SEMANTIC • FED + UTO",
         "model": GROQ_MODEL,
-        "source_scope": "Federal Reserve System official websites only",
+        "source_scope": "Official Federal Reserve System sources + UtoFX/UtoTimes secondary reporting",
         "status": "OK",
     }
 
@@ -1478,13 +1545,34 @@ def get_fed_monitor(telegram_news, utotimes_news):
         return FED_CACHE["result"]
 
     documents = []
-    # Federal Reserve stance is built ONLY from official Federal Reserve System
-    # websites. News feeds remain visible elsewhere on the dashboard but never
-    # enter the Fed score.
+    # Primary sources: official Federal Reserve System websites.
     documents.extend(get_board_speech_documents(30))
     documents.extend(get_board_yearpage_documents(30))
     documents.extend(get_williams_speech_documents(12))
     documents.extend(get_official_regional_fed_documents())
+
+    # Secondary/timely sources: UtoFX and UtoTimes. These are useful for same-day
+    # Q&A/quotes before an official transcript appears, but receive lower weight
+    # and lose to an official source when the two are effectively contemporaneous.
+    for item in telegram_news:
+        doc = _fed_raw_document(
+            item.get("text", ""), source=item.get("source", "UtoFX Telegram"),
+            date=item.get("date"), title=item.get("text", "")[:240],
+            link=item.get("link"), official_source=False,
+        )
+        if doc:
+            documents.append(doc)
+
+    for item in utotimes_news:
+        body = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
+        text = f"{item.get('title','')} {body}"
+        doc = _fed_raw_document(
+            text, source="UtoTimes", date=item.get("date"),
+            title=item.get("title", ""), link=item.get("link"),
+            official_source=False,
+        )
+        if doc:
+            documents.append(doc)
 
     documents = dedupe_fed_documents(documents)
     # Keep up to several recent documents PER SPEAKER. This prevents a cluster of
@@ -1496,8 +1584,8 @@ def get_fed_monitor(telegram_news, utotimes_news):
     if not documents:
         result = {
             "score": 50.0, "events": [], "event_count": 0,
-            "average_stance": 0.0, "mode": "AI SEMANTIC • OFFICIAL FED SOURCES",
-            "model": GROQ_MODEL, "source_scope": "Federal Reserve System official websites only", "status": "NO RECENT DOCUMENTS",
+            "average_stance": 0.0, "mode": "AI SEMANTIC • FED + UTO",
+            "model": GROQ_MODEL, "source_scope": "Official Federal Reserve System sources + UtoFX/UtoTimes secondary reporting", "status": "NO RECENT DOCUMENTS",
         }
         FED_CACHE["time"] = now
         FED_CACHE["result"] = result
@@ -1529,8 +1617,8 @@ def get_fed_monitor(telegram_news, utotimes_news):
                 "events": [],
                 "event_count": 0,
                 "average_stance": 0.0,
-                "mode": "AI SEMANTIC • OFFICIAL FED SOURCES",
-                "model": GROQ_MODEL, "source_scope": "Federal Reserve System official websites only",
+                "mode": "AI SEMANTIC • FED + UTO",
+                "model": GROQ_MODEL, "source_scope": "Official Federal Reserve System sources + UtoFX/UtoTimes secondary reporting",
                 "status": ("API KEY MISSING" if "GROQ_API_KEY" in str(exc) else ("AI RATE LIMIT" if "RATE LIMIT" in str(exc) else "AI TEMPORARILY UNAVAILABLE")),
                 "error": str(exc)[:220],
             }
@@ -2506,7 +2594,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
 {% if data.fed.analyzed_count is defined %}<div class="note">Official candidates sent to AI: <strong>{{ data.fed.candidate_count }}</strong> • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong></div>{% endif %}
 {% if data.fed.error %}<div class="note" style="color:#e6a36f">Fed engine detail: {{ data.fed.error }}</div>{% endif %}
-<div class="note">Source policy: <strong>Official Federal Reserve System websites only</strong>. UtoFX/UtoTimes do not affect the Fed score.</div>
+<div class="note">Source policy: <strong>Official Federal Reserve System sources are primary</strong>; UtoFX/UtoTimes are secondary for timely quotes/Q&amp;A. If sources conflict, the official Fed source wins.</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
 </div>
 <div class="fed-grid">
@@ -2520,7 +2608,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <div class="impact">Semantic stance: {{ event.stance_score }} • Confidence: {{ event.confidence }}% • Gold impact: {% if event.gold_impact>0 %}+{% endif %}{{ event.gold_impact }}</div>
 {% if event.summary %}<div class="event-title" style="margin-top:8px">{{ event.summary }}</div>{% endif %}
 <div class="note" style="margin-top:8px">Inflation: <strong>{{ event.inflation_view }}</strong> • Labor: <strong>{{ event.labor_view }}</strong> • Rate path: <strong>{{ event.rate_path_view }}</strong></div>
-<div class="event-title" style="margin-top:8px">{{ event.title }}</div><div class="news-meta">{{ event.date or '' }} • {{ event.source }}</div>
+<div class="event-title" style="margin-top:8px">{{ event.title }}</div><div class="news-meta">{{ event.date or '' }} • {{ event.source }}{% if event.source_type %} • {{ event.source_type }}{% endif %}</div>
 {% if event.link %}</a>{% endif %}
 </div>
 {% endfor %}
