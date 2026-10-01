@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
+from difflib import SequenceMatcher
 import requests
 import time
 import re
@@ -44,193 +45,264 @@ FOMC_VOTERS_2026 = {
 
 # =========================================================
 # FED SPEAKERS
-# Weight = importance inside our GOLD model
+#
+# Full names can be detected directly.
+# Short surnames ONLY count if the text clearly refers to
+# the U.S. Federal Reserve.
 # =========================================================
 
 FED_SPEAKERS = {
 
     "Kevin Warsh": {
-        "aliases": [
+        "full": [
             "kevin warsh",
+            "کوین وارش"
+        ],
+        "short": [
             "warsh",
-            "کوین وارش",
-            "وارش",
+            "وارش"
         ],
         "weight": 1.50,
     },
 
     "John Williams": {
-        "aliases": [
+        "full": [
             "john williams",
+            "john c. williams",
+            "جان ویلیامز"
+        ],
+        "short": [
             "williams",
-            "جان ویلیامز",
-            "ویلیامز",
-            "ویلیام",
+            "ویلیامز"
         ],
         "weight": 1.35,
     },
 
     "Philip Jefferson": {
-        "aliases": [
+        "full": [
             "philip jefferson",
+            "philip n. jefferson",
+            "فیلیپ جفرسون"
+        ],
+        "short": [
             "jefferson",
-            "فیلیپ جفرسون",
-            "جفرسون",
+            "جفرسون"
         ],
         "weight": 1.25,
     },
 
     "Jerome Powell": {
-        "aliases": [
+        "full": [
             "jerome powell",
+            "jerome h. powell",
+            "جروم پاول"
+        ],
+        "short": [
             "powell",
-            "جروم پاول",
-            "پاول",
+            "پاول"
         ],
         "weight": 1.15,
     },
 
     "Christopher Waller": {
-        "aliases": [
+        "full": [
             "christopher waller",
+            "christopher j. waller",
+            "کریستوفر والر"
+        ],
+        "short": [
             "waller",
-            "کریستوفر والر",
-            "والر",
+            "والر"
         ],
         "weight": 1.10,
     },
 
     "Michelle Bowman": {
-        "aliases": [
+        "full": [
             "michelle bowman",
+            "michelle w. bowman",
+            "میشل بومن"
+        ],
+        "short": [
             "bowman",
-            "میشل بومن",
-            "بومن",
+            "بومن"
         ],
         "weight": 1.10,
     },
 
     "Lisa Cook": {
-        "aliases": [
+        "full": [
             "lisa cook",
+            "lisa d. cook",
+            "لیزا کوک"
+        ],
+        "short": [
             "cook",
-            "لیزا کوک",
-            "کوک",
+            "کوک"
         ],
         "weight": 1.10,
     },
 
     "Michael Barr": {
-        "aliases": [
+        "full": [
             "michael barr",
+            "michael s. barr",
+            "مایکل بار"
+        ],
+        "short": [
             "barr",
-            "مایکل بار",
-            "بار",
+            "بار"
         ],
         "weight": 1.10,
     },
 
     "Beth Hammack": {
-        "aliases": [
+        "full": [
             "beth hammack",
+            "beth m. hammack",
+            "بث همک"
+        ],
+        "short": [
             "hammack",
-            "بث همک",
-            "همک",
+            "همک"
         ],
         "weight": 1.00,
     },
 
     "Neel Kashkari": {
-        "aliases": [
+        "full": [
             "neel kashkari",
+            "نیل کشکاری"
+        ],
+        "short": [
             "kashkari",
-            "نیل کشکاری",
-            "کشکاری",
+            "کشکاری"
         ],
         "weight": 1.00,
     },
 
     "Lorie Logan": {
-        "aliases": [
+        "full": [
             "lorie logan",
+            "لوری لوگان"
+        ],
+        "short": [
             "logan",
-            "لوری لوگان",
-            "لوگان",
+            "لوگان"
         ],
         "weight": 1.00,
     },
 
     "Anna Paulson": {
-        "aliases": [
+        "full": [
             "anna paulson",
+            "آنا پالسون"
+        ],
+        "short": [
             "paulson",
-            "آنا پالسون",
-            "پالسون",
+            "پالسون"
         ],
         "weight": 1.00,
     },
 
     "Mary Daly": {
-        "aliases": [
+        "full": [
             "mary daly",
+            "مری دالی"
+        ],
+        "short": [
             "daly",
-            "مری دالی",
-            "دالی",
+            "دالی"
         ],
         "weight": 0.75,
     },
 
     "Austan Goolsbee": {
-        "aliases": [
+        "full": [
             "austan goolsbee",
+            "آستن گولزبی"
+        ],
+        "short": [
             "goolsbee",
-            "آستن گولزبی",
-            "گولزبی",
+            "گولزبی"
         ],
         "weight": 0.75,
     },
 
     "Thomas Barkin": {
-        "aliases": [
+        "full": [
             "thomas barkin",
+            "توماس بارکین"
+        ],
+        "short": [
             "barkin",
-            "توماس بارکین",
-            "بارکین",
+            "بارکین"
         ],
         "weight": 0.75,
     },
 
     "Susan Collins": {
-        "aliases": [
+        "full": [
             "susan collins",
+            "سوزان کالینز"
+        ],
+        "short": [
             "collins",
-            "سوزان کالینز",
-            "کالینز",
+            "کالینز"
         ],
         "weight": 0.75,
     },
 
     "Alberto Musalem": {
-        "aliases": [
+        "full": [
             "alberto musalem",
+            "آلبرتو موسالم"
+        ],
+        "short": [
             "musalem",
-            "آلبرتو موسالم",
-            "موسالم",
+            "موسالم"
         ],
         "weight": 0.75,
     },
 
     "Jeffrey Schmid": {
-        "aliases": [
+        "full": [
             "jeffrey schmid",
+            "جفری اشمید"
+        ],
+        "short": [
             "schmid",
-            "جفری اشمید",
-            "اشمید",
+            "اشمید"
         ],
         "weight": 0.75,
     },
-
 }
+
+
+# =========================================================
+# STRICT FED CONTEXT
+# =========================================================
+
+STRICT_FED_CONTEXT = [
+
+    "federal reserve",
+    "fomc",
+    "fed governor",
+    "fed chair",
+    "fed vice chair",
+    "federal reserve bank",
+    "the fed",
+    "u.s. central bank",
+    "us central bank",
+
+    "فدرال رزرو",
+    "عضو فد",
+    "عضو فدرال رزرو",
+    "رئیس فد",
+    "رئیس فدرال رزرو",
+    "بانک فدرال رزرو",
+    "کمیته بازار آزاد",
+]
 
 
 # =========================================================
@@ -239,43 +311,53 @@ FED_SPEAKERS = {
 
 HAWKISH_PHRASES = {
 
-    "further tightening": 3,
-    "additional tightening": 3,
-    "further rate increase": 3,
-    "additional rate increase": 3,
-    "need to raise rates": 3,
-    "rates may need to rise": 3,
+    "further tightening": 3.0,
+    "additional tightening": 3.0,
+
+    "further rate increase": 3.0,
+    "additional rate increase": 3.0,
+
+    "need to raise rates": 3.0,
+    "rates may need to rise": 3.0,
 
     "inflation remains too high": 2.5,
     "inflation is too high": 2.5,
     "inflation has been too high": 2.5,
 
-    "upside risks to inflation": 2,
-    "higher for longer": 2,
-    "more restrictive": 2,
-    "not ready to cut": 2,
-    "premature to cut": 2,
+    "upside risks to inflation": 2.0,
+
+    "higher for longer": 2.0,
+    "more restrictive": 2.0,
+
+    "not ready to cut": 2.0,
+    "premature to cut": 2.0,
 
     "persistent inflation": 1.5,
     "price pressures remain": 1.5,
+
     "more work to do": 1.5,
+
 
     "تورم همچنان بالاست": 2.5,
     "تورم هنوز بالاست": 2.5,
+
     "تورم بیش از حد بالاست": 2.5,
 
-    "نیاز به افزایش نرخ": 3,
-    "افزایش بیشتر نرخ": 3,
+    "نیاز به افزایش نرخ": 3.0,
+
+    "افزایش بیشتر نرخ": 3.0,
+
     "افزایش نرخ بهره": 1.5,
 
-    "نرخ بهره بالاتر": 2,
+    "نرخ بهره بالاتر": 2.0,
+
     "فشار تورمی": 1.5,
 
-    "سیاست انقباضی‌تر": 2,
-    "سیاست انقباضی": 1,
+    "سیاست انقباضی‌تر": 2.0,
 
-    "کاهش نرخ زود است": 2,
-    "برای کاهش نرخ زود است": 2,
+    "کاهش نرخ زود است": 2.0,
+
+    "برای کاهش نرخ زود است": 2.0,
 }
 
 
@@ -285,76 +367,65 @@ HAWKISH_PHRASES = {
 
 DOVISH_PHRASES = {
 
-    "no urgency": 3,
-    "no rush": 3,
+    "no urgency": 3.0,
+    "no rush": 3.0,
 
     "can be patient": 2.5,
     "policy can be patient": 2.5,
 
-    "wait and see": 2,
+    "wait and see": 2.0,
 
-    "hold rates": 2,
-    "keep rates unchanged": 2,
-    "pause rate": 2,
+    "hold rates": 2.0,
+    "keep rates unchanged": 2.0,
 
-    "no need to raise": 3,
-    "do not need to raise": 3,
+    "pause rate": 2.0,
 
-    "rate cuts": 2,
-    "lower rates": 2,
-    "less restrictive": 2,
+    "no need to raise": 3.0,
+    "do not need to raise": 3.0,
 
-    "labor market cooling": 2,
-    "labour market cooling": 2,
+    "rate cuts": 2.0,
+    "lower rates": 2.0,
 
-    "downside risks to employment": 2,
+    "less restrictive": 2.0,
+
+    "labor market cooling": 2.0,
+    "labour market cooling": 2.0,
+
+    "downside risks to employment": 2.0,
 
     "inflation has eased": 1.5,
+
     "disinflation": 1.5,
 
-    "نیازی به عجله": 3,
-    "عجله‌ای برای افزایش": 3,
 
-    "نیازی به افزایش سریع": 3,
+    "نیازی به عجله": 3.0,
+
+    "عجله‌ای برای افزایش": 3.0,
+
+    "نیازی به افزایش سریع": 3.0,
+
     "نیازی به افزایش": 2.5,
 
-    "صبر کنیم": 2,
+    "صبر کنیم": 2.0,
+
     "می‌توانیم صبر کنیم": 2.5,
 
-    "ثابت نگه داشتن نرخ": 2,
+    "ثابت نگه داشتن نرخ": 2.0,
+
     "توقف افزایش نرخ": 2.5,
 
-    "کاهش نرخ بهره": 2,
+    "کاهش نرخ بهره": 2.0,
 
-    "بازار کار ضعیف": 2,
-    "بازار کار سرد": 2,
+    "بازار کار ضعیف": 2.0,
+
+    "بازار کار سرد": 2.0,
 
     "کاهش تورم": 1.5,
+
     "تورم کاهش یافته": 1.5,
 
     "ریسک اشتغال": 1.5,
 }
-
-
-FED_CONTEXT_TERMS = [
-
-    "federal reserve",
-    "fomc",
-    "fed ",
-    "monetary policy",
-    "interest rate",
-    "inflation",
-    "employment",
-    "labor market",
-    "labour market",
-
-    "فدرال رزرو",
-    "فد ",
-    "نرخ بهره",
-    "تورم",
-    "سیاست پولی",
-    "بازار کار",
-]
 
 
 # =========================================================
@@ -371,17 +442,291 @@ def clamp(value, minimum=0, maximum=100):
 
 def safe_round(value, digits=2):
 
-    if value is None:
-        return None
-
     try:
+
+        if value is None:
+            return None
+
         return round(
             float(value),
             digits
         )
 
     except Exception:
+
         return None
+
+
+def normalize_text(text):
+
+    text = (
+        text
+        or ""
+    ).lower()
+
+    text = re.sub(
+        r"https?://\S+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"[\u200c\u200f\u202a-\u202e]",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# =========================================================
+# WORD BOUNDARY FIX
+#
+# This is the important fix.
+#
+# Example:
+# Persian "بار" must NOT match inside "بازار".
+# =========================================================
+
+def token_pattern(alias):
+
+    return (
+
+        r"(?<![\w\u0600-\u06FF])"
+
+        + re.escape(
+            alias.lower()
+        )
+
+        + r"(?![\w\u0600-\u06FF])"
+    )
+
+
+# =========================================================
+# FED CONTEXT
+# =========================================================
+
+def has_strict_fed_context(text):
+
+    lower = normalize_text(
+        text
+    )
+
+    return any(
+
+        term in lower
+
+        for term
+        in STRICT_FED_CONTEXT
+    )
+
+
+# =========================================================
+# SPEAKER DETECTION
+# =========================================================
+
+def detect_speaker(
+    text,
+    official_source=False
+):
+
+    lower = normalize_text(
+        text
+    )
+
+
+    # Full name detection
+
+    for speaker, info in (
+        FED_SPEAKERS.items()
+    ):
+
+        for alias in (
+            info["full"]
+        ):
+
+            if re.search(
+                token_pattern(alias),
+                lower,
+                flags=re.IGNORECASE
+            ):
+
+                return speaker
+
+
+    # Short surname detection.
+    # Only allowed when Fed context exists.
+
+    if (
+        official_source
+        or has_strict_fed_context(
+            lower
+        )
+    ):
+
+        for speaker, info in (
+            FED_SPEAKERS.items()
+        ):
+
+            for alias in (
+                info["short"]
+            ):
+
+                if re.search(
+                    token_pattern(alias),
+                    lower,
+                    flags=re.IGNORECASE
+                ):
+
+                    return speaker
+
+
+    return None
+
+
+# =========================================================
+# PHRASE SCORING
+# =========================================================
+
+def phrase_score(
+    text,
+    phrase_map
+):
+
+    lower = normalize_text(
+        text
+    )
+
+    total = 0.0
+
+
+    for phrase, weight in (
+        phrase_map.items()
+    ):
+
+        count = lower.count(
+            phrase.lower()
+        )
+
+        if count:
+
+            total += (
+                count
+                * weight
+            )
+
+
+    return total
+
+
+# =========================================================
+# DATE
+# =========================================================
+
+def parse_date(value):
+
+    if not value:
+        return None
+
+
+    try:
+
+        dt = datetime.fromisoformat(
+
+            value.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+
+    except Exception:
+
+        pass
+
+
+    try:
+
+        dt = parsedate_to_datetime(
+            value
+        )
+
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+
+    except Exception:
+
+        return None
+
+
+def recency_weight(date_value):
+
+    dt = parse_date(
+        date_value
+    )
+
+
+    if not dt:
+
+        return 0.45
+
+
+    hours = max(
+
+        0,
+
+        (
+            datetime.now(
+                timezone.utc
+            )
+            - dt
+        ).total_seconds()
+        / 3600
+    )
+
+
+    if hours <= 6:
+        return 1.00
+
+
+    if hours <= 24:
+        return 0.85
+
+
+    if hours <= 72:
+        return 0.60
+
+
+    if hours <= 168:
+        return 0.35
+
+
+    return 0.15
 
 
 # =========================================================
@@ -397,40 +742,67 @@ def yahoo_market(symbol):
             safe=""
         )
 
+
         url = (
+
             "https://query1.finance.yahoo.com/"
             "v8/finance/chart/"
+
             f"{encoded}"
+
             "?interval=5m&range=1d"
         )
 
+
         r = requests.get(
+
             url,
+
             headers=HEADERS,
+
             timeout=8
         )
 
+
         r.raise_for_status()
 
+
         result = (
+
             r.json()
             ["chart"]
             ["result"][0]
         )
 
-        meta = result["meta"]
+
+        meta = result[
+            "meta"
+        ]
+
 
         price = meta.get(
             "regularMarketPrice"
         )
 
+
         previous = (
-            meta.get("chartPreviousClose")
-            or meta.get("previousClose")
+
+            meta.get(
+                "chartPreviousClose"
+            )
+
+            or
+
+            meta.get(
+                "previousClose"
+            )
         )
 
+
         change = None
+
         change_pct = None
+
 
         if (
             price is not None
@@ -438,14 +810,17 @@ def yahoo_market(symbol):
         ):
 
             change = (
-                price - previous
+                price
+                - previous
             )
 
             change_pct = (
+
                 change
                 / previous
                 * 100
             )
+
 
         return {
 
@@ -482,33 +857,47 @@ def yahoo_market(symbol):
         return {
 
             "price": None,
+
             "previous": None,
+
             "change": None,
+
             "change_pct": None,
+
             "ok": False
         }
 
 
 # =========================================================
-# UTOFX TELEGRAM
+# UTOFX
 # =========================================================
 
-def get_utofx_news(limit=12):
+def get_utofx_news(
+    limit=12
+):
 
     try:
 
         r = requests.get(
+
             "https://t.me/s/UtoFx",
+
             headers=HEADERS,
+
             timeout=10
         )
 
+
         r.raise_for_status()
 
+
         soup = BeautifulSoup(
+
             r.text,
+
             "html.parser"
         )
+
 
         messages = []
 
@@ -517,9 +906,13 @@ def get_utofx_news(limit=12):
             ".tgme_widget_message"
         ):
 
-            text_box = message.select_one(
-                ".tgme_widget_message_text"
+
+            text_box = (
+                message.select_one(
+                    ".tgme_widget_message_text"
+                )
             )
+
 
             if not text_box:
                 continue
@@ -528,6 +921,7 @@ def get_utofx_news(limit=12):
             text = " ".join(
                 text_box.stripped_strings
             )
+
 
             if not text:
                 continue
@@ -538,6 +932,7 @@ def get_utofx_news(limit=12):
                     "time"
                 )
             )
+
 
             link_tag = (
                 message.select_one(
@@ -589,65 +984,81 @@ def get_utofx_news(limit=12):
 # UTOTIMES
 # =========================================================
 
-def get_utotimes_news(limit=8):
+def get_utotimes_news(
+    limit=8
+):
 
     try:
 
         r = requests.get(
+
             "https://utotimes.com/feed/",
+
             headers=HEADERS,
+
             timeout=10
         )
 
+
         r.raise_for_status()
+
 
         root = ET.fromstring(
             r.content
         )
 
+
         news = []
 
 
         for item in (
-            root.findall(".//item")
+            root.findall(
+                ".//item"
+            )
             [:limit]
         ):
 
+
             title = (
+
                 item.findtext(
                     "title"
                 )
-            )
 
-            link = (
-                item.findtext(
-                    "link"
-                )
-            )
+                or ""
 
-            date = (
-                item.findtext(
-                    "pubDate"
-                )
-            )
+            ).strip()
 
 
-            if title:
+            if not title:
+                continue
 
-                news.append({
 
-                    "source":
-                        "UtoTimes",
+            news.append({
 
-                    "text":
-                        title.strip(),
+                "source":
+                    "UtoTimes",
 
-                    "date":
-                        date,
+                "text":
+                    title,
 
-                    "link":
-                        link
-                })
+                "date":
+                    (
+                        item.findtext(
+                            "pubDate"
+                        )
+                        or ""
+                    ).strip(),
+
+                "link":
+                    (
+                        item.findtext(
+                            "link"
+                        )
+                        or ""
+                    ).strip()
+                    or None
+            })
 
 
         return news
@@ -659,201 +1070,167 @@ def get_utotimes_news(limit=8):
 
 
 # =========================================================
-# DATE / RECENCY
+# FETCH PAGE
 # =========================================================
 
-def parse_date(value):
-
-    if not value:
-        return None
-
+def fetch_page(url):
 
     try:
 
-        dt = datetime.fromisoformat(
-            value.replace(
-                "Z",
-                "+00:00"
-            )
+        r = requests.get(
+
+            url,
+
+            headers=HEADERS,
+
+            timeout=10
         )
 
-        if dt.tzinfo is None:
 
-            dt = dt.replace(
-                tzinfo=timezone.utc
+        r.raise_for_status()
+
+
+        soup = BeautifulSoup(
+
+            r.text,
+
+            "html.parser"
+        )
+
+
+        page_date = None
+
+
+        time_tag = soup.find(
+
+            "time",
+
+            attrs={
+                "datetime": True
+            }
+        )
+
+
+        if time_tag:
+
+            page_date = (
+                time_tag.get(
+                    "datetime"
+                )
             )
 
-        return dt.astimezone(
-            timezone.utc
+
+        if not page_date:
+
+            meta = soup.find(
+
+                "meta",
+
+                attrs={
+                    "property":
+                    "article:published_time"
+                }
+            )
+
+
+            if meta:
+
+                page_date = (
+                    meta.get(
+                        "content"
+                    )
+                )
+
+
+        for tag in soup([
+
+            "script",
+            "style",
+            "nav",
+            "footer"
+
+        ]):
+
+            tag.decompose()
+
+
+        main = (
+
+            soup.find(
+                "main"
+            )
+
+            or
+
+            soup.find(
+                id="content"
+            )
+
+            or soup
+        )
+
+
+        paragraphs = [
+
+            p.get_text(
+                " ",
+                strip=True
+            )
+
+            for p
+            in main.find_all(
+                "p"
+            )
+        ]
+
+
+        return (
+
+            " ".join(
+                paragraphs
+            )[:30000],
+
+            page_date
         )
 
 
     except Exception:
-        pass
 
-
-    try:
-
-        dt = parsedate_to_datetime(
-            value
-        )
-
-        if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
-
-        return dt.astimezone(
-            timezone.utc
-        )
-
-
-    except Exception:
-
-        return None
-
-
-def recency_weight(date_value):
-
-    dt = parse_date(
-        date_value
-    )
-
-    if not dt:
-
-        return 0.45
-
-
-    hours = max(
-
-        0,
-
-        (
-            datetime.now(
-                timezone.utc
-            )
-            - dt
-        ).total_seconds()
-        / 3600
-    )
-
-
-    if hours <= 6:
-        return 1.00
-
-    if hours <= 24:
-        return 0.85
-
-    if hours <= 72:
-        return 0.60
-
-    if hours <= 168:
-        return 0.35
-
-    return 0.15
+        return "", None
 
 
 # =========================================================
-# SPEAKER DETECTION
-# =========================================================
-
-def detect_speaker(text):
-
-    lower = text.lower()
-
-
-    for speaker, info in (
-        FED_SPEAKERS.items()
-    ):
-
-        for alias in (
-            info["aliases"]
-        ):
-
-            if (
-                alias.lower()
-                in lower
-            ):
-
-                return speaker
-
-
-    return None
-
-
-def has_fed_context(text):
-
-    lower = text.lower()
-
-
-    if detect_speaker(text):
-
-        return True
-
-
-    return any(
-
-        term.lower()
-        in lower
-
-        for term
-        in FED_CONTEXT_TERMS
-    )
-
-
-# =========================================================
-# LANGUAGE SCORING
-# =========================================================
-
-def phrase_score(
-    text,
-    phrase_map
-):
-
-    lower = re.sub(
-        r"\s+",
-        " ",
-        text.lower()
-    )
-
-    total = 0.0
-
-
-    for phrase, weight in (
-        phrase_map.items()
-    ):
-
-        count = lower.count(
-            phrase.lower()
-        )
-
-        if count:
-
-            total += (
-                count
-                * weight
-            )
-
-
-    return total
-
-
-# =========================================================
-# FED TEXT ANALYSIS
+# ANALYZE FED TEXT
 # =========================================================
 
 def analyze_fed_text(
+
     text,
-    source="News",
+
+    source,
+
     date=None,
+
     title=None,
-    link=None
+
+    link=None,
+
+    official_source=False
 ):
 
+
+    if not text:
+
+        return None
+
+
+    # Secondary news MUST explicitly mention
+    # the U.S. Federal Reserve.
+
     if (
-        not text
-        or not has_fed_context(
+        not official_source
+        and
+        not has_strict_fed_context(
             text
         )
     ):
@@ -861,37 +1238,62 @@ def analyze_fed_text(
         return None
 
 
-    speaker = (
-        detect_speaker(text)
-        or "Federal Reserve"
+    speaker = detect_speaker(
+
+        text,
+
+        official_source=
+            official_source
     )
 
 
+    if not speaker:
+
+        return None
+
+
     hawkish = phrase_score(
+
         text,
+
         HAWKISH_PHRASES
     )
 
 
     dovish = phrase_score(
+
         text,
+
         DOVISH_PHRASES
     )
 
 
     raw_signal = (
+
         dovish
         - hawkish
     )
 
 
     raw_signal = max(
-        -6,
+
+        -6.0,
+
         min(
-            6,
+            6.0,
             raw_signal
         )
     )
+
+
+    # Neutral items have no score impact
+    # and are not displayed.
+
+    if abs(
+        raw_signal
+    ) < 0.75:
+
+        return None
 
 
     if raw_signal >= 2:
@@ -901,7 +1303,9 @@ def analyze_fed_text(
 
     elif raw_signal >= 0.75:
 
-        tone = "SLIGHTLY DOVISH"
+        tone = (
+            "SLIGHTLY DOVISH"
+        )
 
 
     elif raw_signal <= -2:
@@ -909,14 +1313,11 @@ def analyze_fed_text(
         tone = "HAWKISH"
 
 
-    elif raw_signal <= -0.75:
-
-        tone = "SLIGHTLY HAWKISH"
-
-
     else:
 
-        tone = "NEUTRAL"
+        tone = (
+            "SLIGHTLY HAWKISH"
+        )
 
 
     speaker_weight = (
@@ -933,10 +1334,7 @@ def analyze_fed_text(
     )
 
 
-    if source in [
-        "Federal Reserve",
-        "New York Fed"
-    ]:
+    if official_source:
 
         source_weight = 1.00
 
@@ -959,8 +1357,11 @@ def analyze_fed_text(
     gold_impact = (
 
         raw_signal
+
         * speaker_weight
+
         * source_weight
+
         * age_weight
     )
 
@@ -1007,7 +1408,7 @@ def analyze_fed_text(
             (
                 title
                 or text[:180]
-            ),
+            ).strip(),
 
         "link":
             link,
@@ -1015,83 +1416,18 @@ def analyze_fed_text(
         "voter":
             (
                 speaker
-                in FOMC_VOTERS_2026
+                in
+                FOMC_VOTERS_2026
             )
     }
 
 
 # =========================================================
-# FETCH FULL SPEECH
-# =========================================================
-
-def fetch_page_text(url):
-
-    try:
-
-        r = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=10
-        )
-
-        r.raise_for_status()
-
-        soup = BeautifulSoup(
-            r.text,
-            "html.parser"
-        )
-
-
-        for tag in soup([
-            "script",
-            "style",
-            "nav",
-            "footer"
-        ]):
-
-            tag.decompose()
-
-
-        main = (
-            soup.find("main")
-            or soup.find(
-                id="content"
-            )
-            or soup
-        )
-
-
-        paragraphs = [
-
-            p.get_text(
-                " ",
-                strip=True
-            )
-
-            for p
-            in main.find_all("p")
-        ]
-
-
-        return (
-            " ".join(
-                paragraphs
-            )
-            [:30000]
-        )
-
-
-    except Exception:
-
-        return ""
-
-
-# =========================================================
-# OFFICIAL FED SPEECH RSS
+# FEDERAL RESERVE OFFICIAL SPEECHES
 # =========================================================
 
 def get_board_speeches(
-    limit=5
+    limit=6
 ):
 
     items = []
@@ -1105,10 +1441,13 @@ def get_board_speeches(
             "feeds/speeches.xml",
 
             headers=HEADERS,
+
             timeout=10
         )
 
+
         r.raise_for_status()
+
 
         root = ET.fromstring(
             r.content
@@ -1122,67 +1461,89 @@ def get_board_speeches(
             [:limit]
         ):
 
+
             title = (
+
                 item.findtext(
                     "title"
                 )
                 or ""
+
             ).strip()
 
 
             link = (
+
                 item.findtext(
                     "link"
                 )
                 or ""
+
             ).strip()
 
 
             date = (
+
                 item.findtext(
                     "pubDate"
                 )
                 or ""
+
             ).strip()
 
 
             description = (
+
                 item.findtext(
                     "description"
                 )
                 or ""
+
             ).strip()
 
 
-            body = (
-                fetch_page_text(
-                    link
+            if link:
+
+                body, page_date = (
+                    fetch_page(
+                        link
+                    )
                 )
-                if link
-                else ""
+
+            else:
+
+                body = ""
+                page_date = None
+
+
+            date = (
+                date
+                or page_date
             )
 
 
-            full_text = " ".join([
+            analyzed = (
+                analyze_fed_text(
 
-                title,
-                description,
-                body
-            ])
+                    f"""
+                    {title}
+                    {description}
+                    {body}
+                    """,
 
+                    source=
+                        "Federal Reserve",
 
-            analyzed = analyze_fed_text(
+                    date=date,
 
-                full_text,
+                    title=title,
 
-                source=
-                    "Federal Reserve",
+                    link=
+                        link
+                        or None,
 
-                date=date,
-
-                title=title,
-
-                link=link
+                    official_source=True
+                )
             )
 
 
@@ -1202,11 +1563,11 @@ def get_board_speeches(
 
 
 # =========================================================
-# WILLIAMS / NEW YORK FED
+# NEW YORK FED / WILLIAMS
 # =========================================================
 
 def get_williams_speeches(
-    limit=2
+    limit=3
 ):
 
     items = []
@@ -1215,22 +1576,29 @@ def get_williams_speeches(
     try:
 
         index_url = (
+
             "https://www.newyorkfed.org/"
             "newsevents/speeches/index"
         )
 
 
         r = requests.get(
+
             index_url,
+
             headers=HEADERS,
+
             timeout=10
         )
+
 
         r.raise_for_status()
 
 
         soup = BeautifulSoup(
+
             r.text,
+
             "html.parser"
         )
 
@@ -1239,13 +1607,17 @@ def get_williams_speeches(
 
 
         for a in soup.find_all(
+
             "a",
+
             href=True
         ):
+
 
             label = " ".join(
                 a.stripped_strings
             )
+
 
             href = a.get(
                 "href",
@@ -1254,10 +1626,8 @@ def get_williams_speeches(
 
 
             if (
-                "Williams:"
-                not in label
-                and "Williams"
-                not in label
+                "williams"
+                not in label.lower()
             ):
 
                 continue
@@ -1272,7 +1642,9 @@ def get_williams_speeches(
 
 
             link = urljoin(
+
                 index_url,
+
                 href
             )
 
@@ -1287,23 +1659,35 @@ def get_williams_speeches(
             )
 
 
-            body = fetch_page_text(
-                link
+            body, page_date = (
+                fetch_page(
+                    link
+                )
             )
 
 
-            analyzed = analyze_fed_text(
+            analyzed = (
+                analyze_fed_text(
 
-                f"{label} {body}",
+                    f"""
+                    {label}
+                    {body}
+                    """,
 
-                source=
-                    "New York Fed",
+                    source=
+                        "New York Fed",
 
-                date=None,
+                    date=
+                        page_date,
 
-                title=label,
+                    title=
+                        label,
 
-                link=link
+                    link=
+                        link,
+
+                    official_source=True
+                )
             )
 
 
@@ -1331,162 +1715,162 @@ def get_williams_speeches(
 
 
 # =========================================================
-# FED MASTER ENGINE
+# DUPLICATE DETECTION
 # =========================================================
 
-def get_fed_monitor(
-    telegram_news,
-    utotimes_news
+def event_similarity(
+    a,
+    b
 ):
-
-    now = time.time()
 
 
     if (
-
-        FED_CACHE["result"]
-        is not None
-
-        and
-        now
-        - FED_CACHE["time"]
-        < FED_CACHE_SECONDS
-
+        a.get(
+            "speaker"
+        )
+        !=
+        b.get(
+            "speaker"
+        )
     ):
 
-        return FED_CACHE[
-            "result"
-        ]
+        return 0.0
 
 
-    events = []
+    text_a = normalize_text(
 
-
-    # Official Board speeches
-
-    events.extend(
-        get_board_speeches(
-            5
+        a.get(
+            "title",
+            ""
         )
+
+    )[:500]
+
+
+    text_b = normalize_text(
+
+        b.get(
+            "title",
+            ""
+        )
+
+    )[:500]
+
+
+    if (
+        not text_a
+        or
+        not text_b
+    ):
+
+        return 0.0
+
+
+    return SequenceMatcher(
+
+        None,
+
+        text_a,
+
+        text_b
+    ).ratio()
+
+
+def dedupe_fed_events(
+    events
+):
+
+
+    # Official sources get priority
+
+    priority = {
+
+        "Federal Reserve": 3,
+
+        "New York Fed": 3,
+
+        "UtoFX Telegram": 2,
+
+        "UtoTimes": 1
+    }
+
+
+    ordered = sorted(
+
+        events,
+
+        key=lambda e:
+
+            priority.get(
+                e.get(
+                    "source"
+                ),
+                0
+            ),
+
+        reverse=True
     )
 
-
-    # Williams / NY Fed
-
-    events.extend(
-        get_williams_speeches(
-            2
-        )
-    )
-
-
-    # UtoFX news
-
-    for item in telegram_news:
-
-        analyzed = analyze_fed_text(
-
-            item["text"],
-
-            source=
-                item["source"],
-
-            date=
-                item.get(
-                    "date"
-                ),
-
-            title=
-                item["text"][:180],
-
-            link=
-                item.get(
-                    "link"
-                )
-        )
-
-
-        if analyzed:
-
-            events.append(
-                analyzed
-            )
-
-
-    # UtoTimes news
-
-    for item in utotimes_news:
-
-        analyzed = analyze_fed_text(
-
-            item["text"],
-
-            source=
-                item["source"],
-
-            date=
-                item.get(
-                    "date"
-                ),
-
-            title=
-                item["text"][:180],
-
-            link=
-                item.get(
-                    "link"
-                )
-        )
-
-
-        if analyzed:
-
-            events.append(
-                analyzed
-            )
-
-
-    # Remove duplicate events
 
     unique = []
 
-    seen = set()
+
+    for event in ordered:
 
 
-    for event in events:
+        duplicate = False
 
-        key = (
 
-            event.get(
-                "speaker"
-            ),
+        for existing in unique:
 
-            event.get(
-                "title"
-            ),
 
-            event.get(
-                "link"
+            same_link = (
+
+                event.get(
+                    "link"
+                )
+
+                and
+
+                existing.get(
+                    "link"
+                )
+
+                and
+
+                event["link"]
+                ==
+                existing["link"]
             )
-        )
 
 
-        if key in seen:
+            similar = (
 
-            continue
+                event_similarity(
+                    event,
+                    existing
+                )
 
-
-        seen.add(
-            key
-        )
-
-
-        unique.append(
-            event
-        )
+                >= 0.78
+            )
 
 
-    # Newest first
+            if (
+                same_link
+                or similar
+            ):
+
+                duplicate = True
+
+                break
+
+
+        if not duplicate:
+
+            unique.append(
+                event
+            )
+
 
     unique.sort(
 
@@ -1498,19 +1882,163 @@ def get_fed_monitor(
                 )
             )
 
-            or datetime(
+            or
+
+            datetime(
                 2000,
                 1,
                 1,
-                tzinfo=
-                    timezone.utc
+                tzinfo=timezone.utc
             ),
 
         reverse=True
     )
 
 
-    # Last 12 relevant Fed items influence score
+    return unique
+
+
+# =========================================================
+# FED MASTER ENGINE
+# =========================================================
+
+def get_fed_monitor(
+
+    telegram_news,
+
+    utotimes_news
+):
+
+
+    now = time.time()
+
+
+    if (
+
+        FED_CACHE["result"]
+        is not None
+
+        and
+
+        now
+        - FED_CACHE["time"]
+
+        < FED_CACHE_SECONDS
+    ):
+
+        return FED_CACHE[
+            "result"
+        ]
+
+
+    events = []
+
+
+    # Official Fed
+
+    events.extend(
+
+        get_board_speeches(
+            6
+        )
+    )
+
+
+    # Williams / NY Fed
+
+    events.extend(
+
+        get_williams_speeches(
+            3
+        )
+    )
+
+
+    # UtoFX
+
+    for item in telegram_news:
+
+
+        analyzed = (
+            analyze_fed_text(
+
+                item["text"],
+
+                source=
+                    item["source"],
+
+                date=
+                    item.get(
+                        "date"
+                    ),
+
+                title=
+                    item["text"][:220],
+
+                link=
+                    item.get(
+                        "link"
+                    ),
+
+                official_source=False
+            )
+        )
+
+
+        if analyzed:
+
+            events.append(
+                analyzed
+            )
+
+
+    # UtoTimes
+
+    for item in utotimes_news:
+
+
+        analyzed = (
+            analyze_fed_text(
+
+                item["text"],
+
+                source=
+                    item["source"],
+
+                date=
+                    item.get(
+                        "date"
+                    ),
+
+                title=
+                    item["text"][:220],
+
+                link=
+                    item.get(
+                        "link"
+                    ),
+
+                official_source=False
+            )
+        )
+
+
+        if analyzed:
+
+            events.append(
+                analyzed
+            )
+
+
+    # Remove duplicates
+
+    unique = dedupe_fed_events(
+        events
+    )
+
+
+    # Only most recent distinct events
+    # influence the score
 
     total_impact = sum(
 
@@ -1519,20 +2047,25 @@ def get_fed_monitor(
         ]
 
         for event
-        in unique[:12]
+        in unique[:10]
     )
 
 
-    fed_score = clamp(
+    fed_score = (
 
         50
+
         + total_impact
         * 2.2
     )
 
 
     fed_score = round(
-        fed_score,
+
+        clamp(
+            fed_score
+        ),
+
         1
     )
 
@@ -1552,87 +2085,105 @@ def get_fed_monitor(
 
     FED_CACHE["time"] = now
 
-    FED_CACHE[
-        "result"
-    ] = result
+
+    FED_CACHE["result"] = (
+        result
+    )
 
 
     return result
 
 
 # =========================================================
-# GOLD SCORE
+# GOLD SCORE ENGINE
 # =========================================================
 
 def calculate_scores(
+
     markets,
+
     fed_score
 ):
 
+
     gold_change = (
+
         markets["gold"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
     dxy_change = (
+
         markets["dxy"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
     y2_change = (
+
         markets["us2y"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
     y10_change = (
+
         markets["us10y"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
     y30_change = (
+
         markets["us30y"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
     oil_change = (
+
         markets["oil"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
     vix_change = (
+
         markets["vix"]
         .get(
             "change_pct"
         )
+
         or 0
     )
 
 
-    # Dollar rising = pressure on Gold
+    # Dollar
 
     dollar_score = clamp(
 
@@ -1642,9 +2193,9 @@ def calculate_scores(
     )
 
 
-    # Yields rising = pressure on Gold
+    # Rates
 
-    average_rate_move = (
+    rate_move = (
 
         y2_change
         + y10_change
@@ -1656,12 +2207,12 @@ def calculate_scores(
     rates_score = clamp(
 
         50
-        - average_rate_move
+        - rate_move
         * 10
     )
 
 
-    # Gold momentum
+    # Technical
 
     technical_score = clamp(
 
@@ -1671,7 +2222,7 @@ def calculate_scores(
     )
 
 
-    # Risk / VIX
+    # VIX
 
     market_flow_score = clamp(
 
@@ -1681,7 +2232,7 @@ def calculate_scores(
     )
 
 
-    # Oil / inflation pressure
+    # Oil
 
     oil_score = clamp(
 
@@ -1691,20 +2242,10 @@ def calculate_scores(
     )
 
 
-    # Next stages
-
-    economic_score = 50
-
-    geopolitical_score = 50
-
-
     components = {
 
         "Economic Data":
-            round(
-                economic_score,
-                1
-            ),
+            50.0,
 
         "Federal Reserve":
             round(
@@ -1725,10 +2266,7 @@ def calculate_scores(
             ),
 
         "Geopolitical Risk":
-            round(
-                geopolitical_score,
-                1
-            ),
+            50.0,
 
         "Oil / Inflation":
             round(
@@ -1752,21 +2290,29 @@ def calculate_scores(
 
     weights = {
 
-        "Economic Data": 0.20,
+        "Economic Data":
+            0.20,
 
-        "Federal Reserve": 0.20,
+        "Federal Reserve":
+            0.20,
 
-        "Rates": 0.15,
+        "Rates":
+            0.15,
 
-        "US Dollar": 0.15,
+        "US Dollar":
+            0.15,
 
-        "Geopolitical Risk": 0.10,
+        "Geopolitical Risk":
+            0.10,
 
-        "Oil / Inflation": 0.07,
+        "Oil / Inflation":
+            0.07,
 
-        "Market Flow": 0.05,
+        "Market Flow":
+            0.05,
 
-        "Technical": 0.08
+        "Technical":
+            0.08
     }
 
 
@@ -1775,7 +2321,8 @@ def calculate_scores(
         sum(
 
             components[name]
-            * weights[name]
+            *
+            weights[name]
 
             for name
             in components
@@ -1829,14 +2376,17 @@ def calculate_scores(
 
 
     return (
+
         total,
+
         bias,
+
         components
     )
 
 
 # =========================================================
-# BUILD DASHBOARD DATA
+# BUILD DATA
 # =========================================================
 
 def build_dashboard_data():
@@ -1853,11 +2403,13 @@ def build_dashboard_data():
 
         now
         - CACHE["time"]
-        < CACHE_SECONDS
 
+        < CACHE_SECONDS
     ):
 
-        return CACHE["data"]
+        return CACHE[
+            "data"
+        ]
 
 
     markets = {
@@ -1900,6 +2452,7 @@ def build_dashboard_data():
 
 
     telegram_news = (
+
         get_utofx_news(
             12
         )
@@ -1907,6 +2460,7 @@ def build_dashboard_data():
 
 
     utotimes_news = (
+
         get_utotimes_news(
             8
         )
@@ -1916,19 +2470,19 @@ def build_dashboard_data():
     fed = get_fed_monitor(
 
         telegram_news,
+
         utotimes_news
     )
 
 
-    (
-        score,
-        bias,
-        components
+    score, bias, components = (
 
-    ) = calculate_scores(
+        calculate_scores(
 
-        markets,
-        fed["score"]
+            markets,
+
+            fed["score"]
+        )
     )
 
 
@@ -1960,6 +2514,7 @@ def build_dashboard_data():
             datetime.now(
                 timezone.utc
             )
+
             .strftime(
                 "%Y-%m-%d %H:%M:%S UTC"
             )
@@ -1967,6 +2522,7 @@ def build_dashboard_data():
 
 
     CACHE["time"] = now
+
 
     CACHE["data"] = data
 
@@ -2001,6 +2557,7 @@ def dashboard():
 
 
     html = """
+
 <!DOCTYPE html>
 
 <html lang="en">
@@ -2024,295 +2581,548 @@ box-sizing:border-box
 }
 
 body{
+
 margin:0;
+
 background:#080b12;
+
 color:#fff;
-font-family:Arial,Helvetica,sans-serif
+
+font-family:
+Arial,
+Helvetica,
+sans-serif
+
 }
+
 
 .container{
+
 max-width:1250px;
+
 margin:auto;
-padding:30px 20px 60px
+
+padding:
+30px 20px 60px
+
 }
+
 
 .brand{
+
 font-size:14px;
+
 letter-spacing:4px;
+
 color:#d8b96c;
+
 font-weight:bold
+
 }
+
 
 h1{
-margin:8px 0 5px;
-font-size:clamp(28px,5vw,42px)
+
+margin:
+8px 0 5px;
+
+font-size:
+clamp(
+28px,
+5vw,
+42px
+)
+
 }
 
+
 .subtitle{
+
 color:#8f98aa;
+
 margin-bottom:25px
+
 }
+
 
 .hero,
 .panel,
 .market-card,
-.component{
+.component,
+.fed-card{
+
 background:#10151f;
-border:1px solid #222a39;
+
+border:
+1px solid #222a39;
+
 border-radius:14px
+
 }
+
 
 .hero{
+
 padding:35px;
+
 text-align:center;
+
 border-radius:18px
+
 }
+
 
 .score-title{
+
 color:#8f98aa;
+
 font-size:13px;
+
 letter-spacing:2px
+
 }
+
 
 .score{
-font-size:clamp(60px,10vw,95px);
+
+font-size:
+clamp(
+60px,
+10vw,
+95px
+);
+
 font-weight:bold;
+
 margin-top:5px
+
 }
+
 
 .score span{
+
 font-size:22px;
+
 color:#6f7888
+
 }
+
 
 .bias{
+
 display:inline-block;
-padding:9px 18px;
+
+padding:
+9px 18px;
+
 border-radius:30px;
+
 background:#1a2130;
+
 color:#d8b96c;
+
 font-weight:bold
+
 }
+
 
 .bar{
+
 max-width:650px;
+
 height:10px;
+
 background:#252c39;
+
 border-radius:10px;
+
 overflow:hidden;
-margin:30px auto 5px
+
+margin:
+30px auto 5px
+
 }
 
+
 .bar-fill{
+
 height:100%;
-width:{{ data.score }}%;
-background:linear-gradient(
+
+width:
+{{ data.score }}%;
+
+background:
+linear-gradient(
 90deg,
 #c84a4a,
 #d8b96c,
 #51b77a
 )
+
 }
+
 
 .scale{
+
 max-width:650px;
+
 margin:auto;
+
 display:flex;
-justify-content:space-between;
+
+justify-content:
+space-between;
+
 font-size:11px;
+
 color:#727b8b
+
 }
+
 
 .section-title{
-margin:35px 0 15px;
+
+margin:
+35px 0 15px;
+
 font-size:21px
+
 }
+
 
 .market-grid{
+
 display:grid;
+
 grid-template-columns:
-repeat(auto-fit,minmax(155px,1fr));
+repeat(
+auto-fit,
+minmax(
+155px,
+1fr
+)
+);
+
 gap:12px
+
 }
 
-.market-card{
+
+.market-card,
+.component,
+.fed-card{
+
 padding:17px
+
 }
+
 
 .market-title,
 .component-name{
+
 color:#8e98a9;
+
 font-size:13px
+
 }
+
 
 .market-price{
+
 font-size:25px;
+
 font-weight:bold;
+
 margin-top:8px
+
 }
+
 
 .positive{
+
 color:#55c987
+
 }
+
 
 .negative{
+
 color:#e46c6c
+
 }
+
 
 .neutral{
+
 color:#9099a8
+
 }
+
 
 .components{
+
 display:grid;
+
 grid-template-columns:
-repeat(auto-fit,minmax(210px,1fr));
+repeat(
+auto-fit,
+minmax(
+210px,
+1fr
+)
+);
+
 gap:12px
+
 }
 
-.component{
-padding:18px
-}
 
 .component-score{
+
 font-size:29px;
+
 font-weight:bold;
+
 margin-top:8px
+
 }
+
 
 .fed-grid{
+
 display:grid;
+
 grid-template-columns:
-repeat(auto-fit,minmax(260px,1fr));
+repeat(
+auto-fit,
+minmax(
+260px,
+1fr
+)
+);
+
 gap:12px
+
 }
 
-.fed-card{
-background:#10151f;
-border:1px solid #222a39;
-border-radius:14px;
-padding:17px
-}
 
 .fed-top{
+
 display:flex;
+
 align-items:center;
-justify-content:space-between;
+
+justify-content:
+space-between;
+
 gap:12px
+
 }
+
 
 .speaker{
+
 font-weight:bold;
+
 font-size:16px
+
 }
+
 
 .badge{
+
 font-size:10px;
-padding:5px 8px;
+
+padding:
+5px 8px;
+
 border-radius:12px;
+
 background:#1a2130;
+
 color:#8fa0b8
+
 }
+
 
 .tone{
+
 font-size:13px;
+
 font-weight:bold;
+
 margin-top:8px
+
 }
+
 
 .tone-dovish{
+
 color:#55c987
+
 }
+
 
 .tone-hawkish{
+
 color:#e46c6c
+
 }
 
-.tone-neutral{
-color:#d8b96c
-}
 
 .impact{
+
 font-size:12px;
+
 color:#9ca6b6;
+
 margin-top:7px
+
 }
+
 
 .event-title{
+
 font-size:12px;
+
 color:#8792a3;
+
 line-height:1.5;
+
 margin-top:9px
+
 }
+
 
 .news-grid{
+
 display:grid;
-grid-template-columns:1fr 1fr;
+
+grid-template-columns:
+1fr 1fr;
+
 gap:18px
+
 }
+
 
 .panel{
+
 padding:20px
+
 }
+
 
 .news-title{
+
 font-size:18px;
+
 font-weight:bold;
+
 margin-bottom:15px
+
 }
+
 
 .news-item{
-border-top:1px solid #222a39;
-padding:14px 0
+
+border-top:
+1px solid #222a39;
+
+padding:
+14px 0
+
 }
+
 
 .news-item:first-of-type{
+
 border-top:0
+
 }
+
 
 .news-text{
+
 font-size:14px;
+
 line-height:1.7;
+
 direction:rtl;
+
 text-align:right
+
 }
 
+
 .news-meta{
+
 font-size:11px;
+
 color:#707a8b;
+
 margin-top:7px
+
 }
+
 
 .news-item a,
 .fed-card a{
+
 color:inherit;
+
 text-decoration:none
+
 }
+
 
 .status{
+
 margin-top:25px;
+
 background:#10151f;
-border:1px solid #222a39;
+
+border:
+1px solid #222a39;
+
 border-radius:14px;
+
 padding:18px
+
 }
+
 
 .online{
+
 color:#55c987;
+
 font-weight:bold
+
 }
+
 
 .note{
+
 color:#778192;
+
 font-size:12px;
+
 line-height:1.6;
+
 margin-top:10px
+
 }
 
-@media(max-width:750px){
+
+@media(
+max-width:750px
+){
 
 .news-grid{
-grid-template-columns:1fr
+
+grid-template-columns:
+1fr
+
 }
 
 }
@@ -2329,25 +3139,35 @@ grid-template-columns:1fr
 
 
 <div class="brand">
+
 FINAD
+
 </div>
 
 
 <h1>
+
 Gold Intelligence Indicator
+
 </h1>
 
 
 <div class="subtitle">
-Macro • Fed • Rates • Dollar • Geopolitics • Market Data
+
+Macro • Fed • Rates • Dollar
+• Geopolitics • Market Data
+
 </div>
+
 
 
 <div class="hero">
 
 
 <div class="score-title">
+
 GOLD INTELLIGENCE SCORE
+
 </div>
 
 
@@ -2356,20 +3176,25 @@ GOLD INTELLIGENCE SCORE
 {{ data.score }}
 
 <span>
+
 /100
+
 </span>
 
 </div>
 
 
 <div class="bias">
+
 {{ data.bias }}
+
 </div>
 
 
 <div class="bar">
 
 <div class="bar-fill">
+
 </div>
 
 </div>
@@ -2378,25 +3203,34 @@ GOLD INTELLIGENCE SCORE
 <div class="scale">
 
 <span>
+
 BEARISH
+
 </span>
 
 <span>
+
 NEUTRAL
+
 </span>
 
 <span>
+
 BULLISH
+
 </span>
 
 </div>
 
 
 </div>
+
 
 
 <div class="section-title">
+
 Live Markets
+
 </div>
 
 
@@ -2422,41 +3256,58 @@ Live Markets
 } %}
 
 
-{% for key,item in data.markets.items() %}
+{% for key,item
+in data.markets.items() %}
 
 
 <div class="market-card">
 
 
 <div class="market-title">
+
 {{ names[key] }}
+
 </div>
 
 
 <div class="market-price">
 
-{{ item.price if item.price is not none else 'N/A' }}
+{{ item.price
+if item.price is not none
+else 'N/A' }}
 
 </div>
 
 
-{% if item.change_pct is not none %}
+{% if item.change_pct
+is not none %}
 
 
 <div class="
+
 {% if item.change_pct > 0 %}
+
 positive
+
 {% elif item.change_pct < 0 %}
+
 negative
+
 {% else %}
+
 neutral
+
 {% endif %}
+
 ">
 
 
 {% if item.change_pct > 0 %}
+
 +
+
 {% endif %}
+
 
 {{ item.change_pct }}%
 
@@ -2467,7 +3318,9 @@ neutral
 
 
 <div class="neutral">
+
 Data unavailable
+
 </div>
 
 
@@ -2483,22 +3336,28 @@ Data unavailable
 </div>
 
 
+
 <div class="section-title">
+
 Gold Score Components
+
 </div>
 
 
 <div class="components">
 
 
-{% for name,value in data.components.items() %}
+{% for name,value
+in data.components.items() %}
 
 
 <div class="component">
 
 
 <div class="component-name">
+
 {{ name }}
+
 </div>
 
 
@@ -2515,7 +3374,6 @@ color:#697282
 
 </span>
 
-
 </div>
 
 
@@ -2528,8 +3386,11 @@ color:#697282
 </div>
 
 
+
 <div class="section-title">
+
 Fed Monitor
+
 </div>
 
 
@@ -2548,13 +3409,16 @@ Federal Reserve Score:
 
 <span class="note">
 
-• {{ data.fed.event_count }}
-relevant Fed items detected
+•
+{{ data.fed.event_count }}
+
+distinct non-neutral Fed items detected
 
 </span>
 
 
 </div>
+
 
 
 <div class="fed-grid">
@@ -2563,7 +3427,8 @@ relevant Fed items detected
 {% if data.fed.events %}
 
 
-{% for event in data.fed.events %}
+{% for event
+in data.fed.events %}
 
 
 <div class="fed-card">
@@ -2592,7 +3457,7 @@ target="_blank">
 
 {{ '2026 VOTER'
 if event.voter
-else 'NON-VOTER / GENERIC' }}
+else 'NON-VOTER' }}
 
 </div>
 
@@ -2601,25 +3466,16 @@ else 'NON-VOTER / GENERIC' }}
 
 
 {% set toneclass =
-'tone-neutral' %}
+'tone-dovish'
+if 'DOVISH' in event.tone
+else 'tone-hawkish'
+%}
 
 
-{% if 'DOVISH'
-in event.tone %}
-
-{% set toneclass =
-'tone-dovish' %}
-
-{% elif 'HAWKISH'
-in event.tone %}
-
-{% set toneclass =
-'tone-hawkish' %}
-
-{% endif %}
-
-
-<div class="tone {{ toneclass }}">
+<div class="
+tone
+{{ toneclass }}
+">
 
 {{ event.tone }}
 
@@ -2631,12 +3487,16 @@ in event.tone %}
 Gold impact:
 
 {% if event.gold_impact > 0 %}
+
 +
+
 {% endif %}
 
 {{ event.gold_impact }}
 
-• {{ event.source }}
+•
+
+{{ event.source }}
 
 </div>
 
@@ -2675,7 +3535,7 @@ Gold impact:
 
 <div class="note">
 
-No Fed items detected yet.
+No non-neutral Fed items detected yet.
 
 </div>
 
@@ -2688,8 +3548,11 @@ No Fed items detected yet.
 </div>
 
 
+
 <div class="section-title">
+
 Live News Monitor
+
 </div>
 
 
@@ -2700,14 +3563,17 @@ Live News Monitor
 
 
 <div class="news-title">
+
 UtoFX Telegram
+
 </div>
 
 
 {% if data.telegram_news %}
 
 
-{% for news in data.telegram_news %}
+{% for news
+in data.telegram_news %}
 
 
 <div class="news-item">
@@ -2765,18 +3631,22 @@ Telegram feed temporarily unavailable.
 </div>
 
 
+
 <div class="panel">
 
 
 <div class="news-title">
+
 UtoTimes
+
 </div>
 
 
 {% if data.utotimes_news %}
 
 
-{% for news in data.utotimes_news %}
+{% for news
+in data.utotimes_news %}
 
 
 <div class="news-item">
@@ -2837,19 +3707,23 @@ UtoTimes feed temporarily unavailable.
 </div>
 
 
+
 <div class="status">
 
 
 SYSTEM STATUS:
 
 <span class="online">
+
 ONLINE
+
 </span>
 
 
 <div class="note">
 
 Last calculation:
+
 {{ data.updated }}
 
 </div>
@@ -2858,6 +3732,7 @@ Last calculation:
 <div class="note">
 
 Market dashboard refresh:
+
 30 seconds
 
 </div>
@@ -2866,6 +3741,7 @@ Market dashboard refresh:
 <div class="note">
 
 Fed analysis refresh:
+
 5 minutes
 
 </div>
@@ -2873,11 +3749,11 @@ Fed analysis refresh:
 
 <div class="note">
 
-Fed Engine uses official Federal Reserve speeches,
-New York Fed Williams speeches,
-UtoFX and UtoTimes.
+Fed news now requires explicit
+U.S. Federal Reserve context.
 
-No paid AI API is used.
+Ambiguous surname matches are blocked
+and duplicate items are removed.
 
 </div>
 
@@ -2894,6 +3770,7 @@ remain at 50 until the next stages.
 
 
 </div>
+
 
 
 <script>
@@ -2916,6 +3793,7 @@ window.location.reload();
 </body>
 
 </html>
+
 """
 
 
