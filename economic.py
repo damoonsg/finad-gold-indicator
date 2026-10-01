@@ -23,14 +23,12 @@ HEADERS = {
 
 # =========================================================
 # CACHE
-#
-# Important:
-# Do NOT request Forex Factory every 30 seconds.
 # =========================================================
 
 ECON_CACHE = {
     "time": 0,
-    "result": None
+    "result": None,
+    "last_2y": None
 }
 
 ECON_CACHE_SECONDS = 300
@@ -40,75 +38,134 @@ ECON_CACHE_SECONDS = 300
 # EVENT PROFILES
 #
 # direction:
+# +1 = higher actual tends to help Gold
+# -1 = higher actual tends to hurt Gold
 #
-# +1 = Higher actual tends to HELP gold
-#      Example: Jobless Claims / Unemployment
+# immediate_weight:
+# reaction around the release
 #
-# -1 = Higher actual tends to HURT gold
-#      Example: CPI / PCE / NFP
+# policy_weight:
+# importance for Fed path
 #
-# scale:
-# Typical surprise size used to normalize the event.
-#
-# weight:
-# Importance inside Economic Score.
+# persistence_hours:
+# how long policy effect should matter
 # =========================================================
 
 EVENT_PROFILES = [
 
-    # -------------------------
-    # PCE
-    # -------------------------
+    # =====================================================
+    # INFLATION
+    # =====================================================
 
     {
         "keywords": [
             "core pce price index"
         ],
+        "name": "Core PCE",
+        "category": "Inflation",
         "direction": -1,
         "scale": 0.10,
-        "weight": 3.4,
-        "name": "Core PCE"
+        "immediate_weight": 3.5,
+        "policy_weight": 5.0,
+        "persistence_hours": 336
     },
 
     {
         "keywords": [
             "pce price index"
         ],
+        "name": "Headline PCE",
+        "category": "Inflation",
         "direction": -1,
         "scale": 0.10,
-        "weight": 3.0,
-        "name": "PCE"
+        "immediate_weight": 3.0,
+        "policy_weight": 4.3,
+        "persistence_hours": 336
     },
-
-
-    # -------------------------
-    # CPI
-    # -------------------------
 
     {
         "keywords": [
             "core cpi"
         ],
+        "name": "Core CPI",
+        "category": "Inflation",
         "direction": -1,
         "scale": 0.10,
-        "weight": 3.4,
-        "name": "Core CPI"
+        "immediate_weight": 3.8,
+        "policy_weight": 4.8,
+        "persistence_hours": 336
     },
 
     {
         "keywords": [
             "cpi"
         ],
+        "name": "Headline CPI",
+        "category": "Inflation",
         "direction": -1,
         "scale": 0.10,
-        "weight": 3.1,
-        "name": "CPI"
+        "immediate_weight": 3.4,
+        "policy_weight": 4.0,
+        "persistence_hours": 240
+    },
+
+    {
+        "keywords": [
+            "core ppi"
+        ],
+        "name": "Core PPI",
+        "category": "Inflation",
+        "direction": -1,
+        "scale": 0.15,
+        "immediate_weight": 2.0,
+        "policy_weight": 2.0,
+        "persistence_hours": 120
+    },
+
+    {
+        "keywords": [
+            "ppi"
+        ],
+        "name": "PPI",
+        "category": "Inflation",
+        "direction": -1,
+        "scale": 0.15,
+        "immediate_weight": 1.7,
+        "policy_weight": 1.6,
+        "persistence_hours": 96
+    },
+
+    {
+        "keywords": [
+            "ism manufacturing prices",
+            "ism prices paid"
+        ],
+        "name": "ISM Prices Paid",
+        "category": "Inflation",
+        "direction": -1,
+        "scale": 2.0,
+        "immediate_weight": 2.5,
+        "policy_weight": 3.0,
+        "persistence_hours": 168
+    },
+
+    {
+        "keywords": [
+            "ism services prices"
+        ],
+        "name": "ISM Services Prices",
+        "category": "Inflation",
+        "direction": -1,
+        "scale": 2.0,
+        "immediate_weight": 2.6,
+        "policy_weight": 3.2,
+        "persistence_hours": 168
     },
 
 
-    # -------------------------
+    # =====================================================
     # LABOR
-    # -------------------------
+    # =====================================================
 
     {
         "keywords": [
@@ -116,30 +173,39 @@ EVENT_PROFILES = [
             "nonfarm payrolls",
             "non-farm payrolls"
         ],
+        "name": "Nonfarm Payrolls",
+        "category": "Labor",
         "direction": -1,
         "scale": 50.0,
-        "weight": 3.3,
-        "name": "Nonfarm Payrolls"
+        "immediate_weight": 4.0,
+        "policy_weight": 4.5,
+        "persistence_hours": 336
     },
 
     {
         "keywords": [
             "unemployment rate"
         ],
+        "name": "Unemployment Rate",
+        "category": "Labor",
         "direction": +1,
         "scale": 0.10,
-        "weight": 3.0,
-        "name": "Unemployment Rate"
+        "immediate_weight": 3.5,
+        "policy_weight": 4.2,
+        "persistence_hours": 336
     },
 
     {
         "keywords": [
             "average hourly earnings"
         ],
+        "name": "Average Hourly Earnings",
+        "category": "Labor",
         "direction": -1,
         "scale": 0.10,
-        "weight": 2.6,
-        "name": "Average Hourly Earnings"
+        "immediate_weight": 3.0,
+        "policy_weight": 3.8,
+        "persistence_hours": 240
     },
 
     {
@@ -147,20 +213,26 @@ EVENT_PROFILES = [
             "initial jobless claims",
             "unemployment claims"
         ],
+        "name": "Initial Jobless Claims",
+        "category": "Labor",
         "direction": +1,
         "scale": 10.0,
-        "weight": 2.0,
-        "name": "Initial Jobless Claims"
+        "immediate_weight": 2.3,
+        "policy_weight": 1.2,
+        "persistence_hours": 72
     },
 
     {
         "keywords": [
             "continuing claims"
         ],
+        "name": "Continuing Claims",
+        "category": "Labor",
         "direction": +1,
         "scale": 25.0,
-        "weight": 1.5,
-        "name": "Continuing Claims"
+        "immediate_weight": 1.5,
+        "policy_weight": 1.4,
+        "persistence_hours": 96
     },
 
     {
@@ -168,56 +240,44 @@ EVENT_PROFILES = [
             "adp non-farm",
             "adp employment"
         ],
+        "name": "ADP Employment",
+        "category": "Labor",
         "direction": -1,
         "scale": 40.0,
-        "weight": 1.5,
-        "name": "ADP Employment"
+        "immediate_weight": 1.6,
+        "policy_weight": 1.1,
+        "persistence_hours": 72
     },
 
     {
         "keywords": [
             "jolts job openings"
         ],
+        "name": "JOLTS",
+        "category": "Labor",
         "direction": -1,
         "scale": 250.0,
-        "weight": 1.6,
-        "name": "JOLTS"
+        "immediate_weight": 1.8,
+        "policy_weight": 1.8,
+        "persistence_hours": 120
     },
 
 
-    # -------------------------
-    # ISM
-    # -------------------------
-
-    {
-        "keywords": [
-            "ism manufacturing prices",
-            "ism prices paid"
-        ],
-        "direction": -1,
-        "scale": 2.0,
-        "weight": 2.5,
-        "name": "ISM Prices Paid"
-    },
-
-    {
-        "keywords": [
-            "ism services prices"
-        ],
-        "direction": -1,
-        "scale": 2.0,
-        "weight": 2.6,
-        "name": "ISM Services Prices"
-    },
+    # =====================================================
+    # GROWTH / ACTIVITY
+    # =====================================================
 
     {
         "keywords": [
             "ism manufacturing pmi"
         ],
+        "name": "ISM Manufacturing",
+        "category": "Growth",
         "direction": -1,
         "scale": 1.0,
-        "weight": 2.0,
-        "name": "ISM Manufacturing"
+        "immediate_weight": 2.2,
+        "policy_weight": 1.8,
+        "persistence_hours": 120
     },
 
     {
@@ -225,41 +285,14 @@ EVENT_PROFILES = [
             "ism services pmi",
             "ism non-manufacturing"
         ],
+        "name": "ISM Services",
+        "category": "Growth",
         "direction": -1,
         "scale": 1.0,
-        "weight": 2.2,
-        "name": "ISM Services"
+        "immediate_weight": 2.5,
+        "policy_weight": 2.2,
+        "persistence_hours": 144
     },
-
-
-    # -------------------------
-    # RETAIL SALES
-    # -------------------------
-
-    {
-        "keywords": [
-            "core retail sales"
-        ],
-        "direction": -1,
-        "scale": 0.30,
-        "weight": 2.0,
-        "name": "Core Retail Sales"
-    },
-
-    {
-        "keywords": [
-            "retail sales"
-        ],
-        "direction": -1,
-        "scale": 0.30,
-        "weight": 1.9,
-        "name": "Retail Sales"
-    },
-
-
-    # -------------------------
-    # GDP
-    # -------------------------
 
     {
         "keywords": [
@@ -268,61 +301,71 @@ EVENT_PROFILES = [
             "final gdp",
             "gdp"
         ],
+        "name": "GDP",
+        "category": "Growth",
         "direction": -1,
         "scale": 0.50,
-        "weight": 1.8,
-        "name": "GDP"
+        "immediate_weight": 2.0,
+        "policy_weight": 2.0,
+        "persistence_hours": 168
     },
 
 
-    # -------------------------
-    # PPI
-    # -------------------------
+    # =====================================================
+    # CONSUMPTION
+    # =====================================================
 
     {
         "keywords": [
-            "core ppi"
+            "core retail sales"
         ],
+        "name": "Core Retail Sales",
+        "category": "Consumption",
         "direction": -1,
-        "scale": 0.15,
-        "weight": 1.8,
-        "name": "Core PPI"
+        "scale": 0.30,
+        "immediate_weight": 2.2,
+        "policy_weight": 1.8,
+        "persistence_hours": 120
     },
 
     {
         "keywords": [
-            "ppi"
+            "retail sales"
         ],
+        "name": "Retail Sales",
+        "category": "Consumption",
         "direction": -1,
-        "scale": 0.15,
-        "weight": 1.6,
-        "name": "PPI"
+        "scale": 0.30,
+        "immediate_weight": 2.0,
+        "policy_weight": 1.6,
+        "persistence_hours": 96
     },
-
-
-    # -------------------------
-    # CONSUMER
-    # -------------------------
 
     {
         "keywords": [
             "consumer confidence"
         ],
+        "name": "Consumer Confidence",
+        "category": "Consumption",
         "direction": -1,
         "scale": 3.0,
-        "weight": 1.1,
-        "name": "Consumer Confidence"
+        "immediate_weight": 1.1,
+        "policy_weight": 0.8,
+        "persistence_hours": 72
     },
 
     {
         "keywords": [
             "consumer sentiment"
         ],
+        "name": "Consumer Sentiment",
+        "category": "Consumption",
         "direction": -1,
         "scale": 2.0,
-        "weight": 1.1,
-        "name": "Consumer Sentiment"
-    },
+        "immediate_weight": 1.1,
+        "policy_weight": 0.8,
+        "persistence_hours": 72
+    }
 ]
 
 
@@ -347,16 +390,6 @@ def clean_title(value):
     ).strip()
 
 
-# =========================================================
-# NUMBER PARSER
-#
-# Examples:
-#
-# 197K   -> 197
-# 1.72M  -> 1720
-# 3.4%   -> 3.4
-# =========================================================
-
 def parse_number(value):
 
     if value is None:
@@ -364,7 +397,6 @@ def parse_number(value):
 
 
     text = str(value).strip()
-
 
     if not text:
         return None
@@ -384,21 +416,18 @@ def parse_number(value):
     if text.upper().endswith("K"):
 
         multiplier = 1.0
-
         text = text[:-1]
 
 
     elif text.upper().endswith("M"):
 
         multiplier = 1000.0
-
         text = text[:-1]
 
 
     elif text.upper().endswith("B"):
 
         multiplier = 1000000.0
-
         text = text[:-1]
 
 
@@ -421,7 +450,6 @@ def parse_number(value):
 def parse_event_date(value):
 
     if not value:
-
         return None
 
 
@@ -452,61 +480,111 @@ def parse_event_date(value):
         return None
 
 
-def recency_weight(date_value):
+def hours_since(value):
 
     dt = parse_event_date(
-        date_value
+        value
     )
 
 
     if not dt:
 
-        return 0.50
+        return None
 
 
-    now = datetime.now(
-        timezone.utc
+    return max(
+
+        0,
+
+        (
+            datetime.now(
+                timezone.utc
+            )
+            - dt
+        ).total_seconds()
+        / 3600
     )
 
 
-    hours = (
+# =========================================================
+# IMMEDIATE DECAY
+#
+# News shock should disappear relatively quickly.
+# =========================================================
 
-        now - dt
+def immediate_decay(date_value):
 
-    ).total_seconds() / 3600
+    hours = hours_since(
+        date_value
+    )
 
 
-    if hours < 0:
+    if hours is None:
+        return 0.25
+
+
+    if hours <= 1:
+        return 1.00
+
+
+    if hours <= 3:
+        return 0.85
+
+
+    if hours <= 6:
+        return 0.60
+
+
+    if hours <= 12:
+        return 0.35
+
+
+    if hours <= 24:
+        return 0.15
+
+
+    return 0.0
+
+
+# =========================================================
+# POLICY DECAY
+#
+# Policy effect persists much longer.
+# =========================================================
+
+def policy_decay(
+    date_value,
+    persistence_hours
+):
+
+    hours = hours_since(
+        date_value
+    )
+
+
+    if hours is None:
+
+        return 0.30
+
+
+    if hours > persistence_hours:
 
         return 0.0
 
 
-    if hours <= 6:
-
-        return 1.00
-
-
-    if hours <= 24:
-
-        return 0.85
+    ratio = (
+        hours
+        / persistence_hours
+    )
 
 
-    if hours <= 48:
+    # Slow linear decay.
+    # Still meaningful days later.
 
-        return 0.65
-
-
-    if hours <= 72:
-
-        return 0.45
-
-
-    if hours <= 168:
-
-        return 0.20
-
-
-    return 0.0
+    return max(
+        0.15,
+        1.0 - ratio
+    )
 
 
 # =========================================================
@@ -521,25 +599,22 @@ def impact_weight(value):
 
 
     if "high" in text:
-
         return 1.00
 
 
     if "medium" in text:
-
         return 0.65
 
 
     if "low" in text:
-
         return 0.30
 
 
-    return 0.40
+    return 0.45
 
 
 # =========================================================
-# EVENT PROFILE MATCH
+# PROFILE MATCH
 # =========================================================
 
 def find_profile(title):
@@ -564,7 +639,7 @@ def find_profile(title):
 
 
 # =========================================================
-# FETCH FOREX FACTORY
+# FOREX FACTORY
 # =========================================================
 
 def fetch_calendar():
@@ -604,10 +679,90 @@ def fetch_calendar():
 
 
 # =========================================================
+# 2Y CONFIRMATION
+#
+# two_year_change_pct:
+#
+# negative = 2Y falling
+# positive = 2Y rising
+#
+# Dovish data should normally push 2Y down.
+# Hawkish data should normally push 2Y up.
+#
+# This is confirmation only.
+# It NEVER creates the original signal.
+# =========================================================
+
+def yield_confirmation(
+    policy_signal,
+    two_year_change_pct
+):
+
+    if (
+        two_year_change_pct
+        is None
+        or
+        abs(policy_signal) < 0.10
+    ):
+
+        return {
+            "status": "NO CONFIRMATION DATA",
+            "multiplier": 1.00
+        }
+
+
+    # Gold-positive / dovish signal
+
+    if policy_signal > 0:
+
+        if two_year_change_pct < -0.05:
+
+            return {
+                "status": "CONFIRMED",
+                "multiplier": 1.20
+            }
+
+        elif two_year_change_pct > 0.05:
+
+            return {
+                "status": "REJECTED BY 2Y",
+                "multiplier": 0.60
+            }
+
+
+    # Gold-negative / hawkish signal
+
+    elif policy_signal < 0:
+
+        if two_year_change_pct > 0.05:
+
+            return {
+                "status": "CONFIRMED",
+                "multiplier": 1.20
+            }
+
+        elif two_year_change_pct < -0.05:
+
+            return {
+                "status": "REJECTED BY 2Y",
+                "multiplier": 0.60
+            }
+
+
+    return {
+        "status": "NOT CONFIRMED",
+        "multiplier": 0.85
+    }
+
+
+# =========================================================
 # EVENT SCORING
 # =========================================================
 
-def score_event(event):
+def score_event(
+    event,
+    two_year_change_pct=None
+):
 
     title = clean_title(
         event.get(
@@ -647,21 +802,14 @@ def score_event(event):
     )
 
 
-    # Event not released yet
-
     if actual is None:
 
         return None
 
 
-    # Best comparison:
-    # Actual vs Forecast
-
     comparison = None
-
+    comparison_basis = None
     confidence = 1.0
-
-    basis = None
 
 
     if forecast is not None:
@@ -671,7 +819,9 @@ def score_event(event):
             - forecast
         )
 
-        basis = "forecast"
+        comparison_basis = (
+            "forecast"
+        )
 
 
     elif previous is not None:
@@ -681,10 +831,9 @@ def score_event(event):
             - previous
         )
 
-        basis = "previous"
-
-        # Previous comparison is weaker
-        # than consensus surprise.
+        comparison_basis = (
+            "previous"
+        )
 
         confidence = 0.45
 
@@ -694,25 +843,12 @@ def score_event(event):
         return None
 
 
-    scale = profile[
-        "scale"
-    ]
-
-
-    if not scale:
-
-        return None
-
-
     normalized_surprise = (
 
         comparison
-        / scale
+        / profile["scale"]
     )
 
-
-    # Prevent one unusual release
-    # destroying the whole index.
 
     normalized_surprise = max(
 
@@ -725,9 +861,7 @@ def score_event(event):
     )
 
 
-    # Gold direction
-
-    gold_signal = (
+    gold_direction_signal = (
 
         normalized_surprise
 
@@ -744,81 +878,135 @@ def score_event(event):
     )
 
 
-    recency = recency_weight(
-        event.get(
-            "date"
-        )
-    )
+    # =====================================================
+    # IMMEDIATE IMPACT
+    # =====================================================
 
+    immediate = (
 
-    contribution = (
-
-        gold_signal
+        gold_direction_signal
 
         * profile[
-            "weight"
+            "immediate_weight"
         ]
 
         * impact
 
-        * recency
-
         * confidence
 
-        * 1.70
+        * immediate_decay(
+            event.get(
+                "date"
+            )
+        )
     )
 
 
-    contribution = max(
+    immediate = max(
 
         -10,
 
         min(
             10,
-            contribution
+            immediate
         )
     )
 
 
-    if contribution >= 2.5:
+    # =====================================================
+    # FED POLICY IMPACT
+    # =====================================================
 
-        gold_effect = (
-            "BULLISH"
+    raw_policy = (
+
+        gold_direction_signal
+
+        * profile[
+            "policy_weight"
+        ]
+
+        * impact
+
+        * confidence
+
+        * policy_decay(
+
+            event.get(
+                "date"
+            ),
+
+            profile[
+                "persistence_hours"
+            ]
         )
+    )
 
 
-    elif contribution >= 0.5:
+    confirmation = (
+        yield_confirmation(
 
-        gold_effect = (
-            "SLIGHTLY BULLISH"
+            raw_policy,
+
+            two_year_change_pct
         )
+    )
 
 
-    elif contribution <= -2.5:
+    policy = (
 
-        gold_effect = (
-            "BEARISH"
+        raw_policy
+
+        * confirmation[
+            "multiplier"
+        ]
+    )
+
+
+    policy = max(
+
+        -10,
+
+        min(
+            10,
+            policy
         )
+    )
 
 
-    elif contribution <= -0.5:
+    # =====================================================
+    # LABELS
+    # =====================================================
 
-        gold_effect = (
-            "SLIGHTLY BEARISH"
-        )
+    def effect_label(value):
 
+        if value >= 4:
+            return "STRONGLY BULLISH"
 
-    else:
+        if value >= 1.5:
+            return "BULLISH"
 
-        gold_effect = (
-            "NEUTRAL"
-        )
+        if value >= 0.4:
+            return "SLIGHTLY BULLISH"
+
+        if value <= -4:
+            return "STRONGLY BEARISH"
+
+        if value <= -1.5:
+            return "BEARISH"
+
+        if value <= -0.4:
+            return "SLIGHTLY BEARISH"
+
+        return "NEUTRAL"
 
 
     return {
 
         "name":
             profile["name"],
+
+        "category":
+            profile["category"],
 
         "title":
             title,
@@ -849,7 +1037,7 @@ def score_event(event):
             ),
 
         "basis":
-            basis,
+            comparison_basis,
 
         "surprise":
             round(
@@ -857,37 +1045,162 @@ def score_event(event):
                 2
             ),
 
-        "gold_effect":
-            gold_effect,
-
-        "gold_impact":
+        "immediate_impact":
             round(
-                contribution,
+                immediate,
                 2
-            )
+            ),
+
+        "immediate_effect":
+            effect_label(
+                immediate
+            ),
+
+        "policy_impact":
+            round(
+                policy,
+                2
+            ),
+
+        "policy_effect":
+            effect_label(
+                policy
+            ),
+
+        "confirmation":
+            confirmation[
+                "status"
+            ],
+
+        "persistence_hours":
+            profile[
+                "persistence_hours"
+            ]
     }
+
+
+# =========================================================
+# CATEGORY SCORES
+# =========================================================
+
+def build_category_scores(
+    events
+):
+
+    categories = {
+
+        "Inflation": 50.0,
+        "Labor": 50.0,
+        "Growth": 50.0,
+        "Consumption": 50.0
+    }
+
+
+    for category in categories:
+
+        impact = sum(
+
+            event[
+                "policy_impact"
+            ]
+
+            for event in events
+
+            if event[
+                "category"
+            ] == category
+        )
+
+
+        categories[
+            category
+        ] = round(
+
+            clamp(
+                50
+                + impact
+            ),
+
+            1
+        )
+
+
+    return categories
+
+
+# =========================================================
+# UNDERLYING ECONOMY SCORE
+#
+# 50 = neutral
+# >50 = softer economy / more Gold-friendly
+# <50 = stronger economy / more Gold-negative
+# =========================================================
+
+def build_underlying_score(
+    category_scores
+):
+
+    score = (
+
+        category_scores[
+            "Labor"
+        ] * 0.40
+
+        +
+
+        category_scores[
+            "Growth"
+        ] * 0.35
+
+        +
+
+        category_scores[
+            "Consumption"
+        ] * 0.25
+    )
+
+
+    return round(
+        score,
+        1
+    )
 
 
 # =========================================================
 # ECONOMIC MASTER ENGINE
 # =========================================================
 
-def get_economic_monitor():
+def get_economic_monitor(
+    two_year_change_pct=None
+):
 
     now = time.time()
 
 
+    # If same 2Y input and cache still fresh,
+    # return cached result.
+
     if (
 
-        ECON_CACHE["result"]
-        is not None
+        ECON_CACHE[
+            "result"
+        ] is not None
 
         and
 
         now
-        - ECON_CACHE["time"]
-
+        - ECON_CACHE[
+            "time"
+        ]
         < ECON_CACHE_SECONDS
+
+        and
+
+        ECON_CACHE[
+            "last_2y"
+        ]
+        ==
+        two_year_change_pct
     ):
 
         return ECON_CACHE[
@@ -895,16 +1208,15 @@ def get_economic_monitor():
         ]
 
 
-    raw_events = fetch_calendar()
+    raw_events = (
+        fetch_calendar()
+    )
 
 
     scored_events = []
 
 
     for event in raw_events:
-
-        # Forex Factory calls
-        # currency field "country".
 
         currency = str(
 
@@ -921,15 +1233,18 @@ def get_economic_monitor():
             continue
 
 
-        result = score_event(
-            event
+        scored = score_event(
+
+            event,
+
+            two_year_change_pct
         )
 
 
-        if result:
+        if scored:
 
             scored_events.append(
-                result
+                scored
             )
 
 
@@ -954,80 +1269,136 @@ def get_economic_monitor():
     )
 
 
-    # Only recent relevant releases
-    # should influence current bias.
+    # =====================================================
+    # IMMEDIATE SCORE
+    # Only events still carrying short-term impact matter.
+    # =====================================================
 
-    relevant = [
+    immediate_events = [
 
         event
 
         for event
         in scored_events
 
-        if recency_weight(
-            event.get(
-                "date"
-            )
-        ) > 0
+        if abs(
+            event[
+                "immediate_impact"
+            ]
+        ) > 0.01
     ]
 
 
-    total_impact = sum(
+    immediate_total = sum(
 
         event[
-            "gold_impact"
+            "immediate_impact"
         ]
 
         for event
-        in relevant[:15]
+        in immediate_events[:12]
     )
 
 
-    economic_score = clamp(
+    market_shock_score = round(
 
-        50
-        + total_impact
-    )
+        clamp(
+            50
+            + immediate_total
+        ),
 
-
-    economic_score = round(
-
-        economic_score,
         1
     )
 
 
-    if economic_score >= 65:
+    # =====================================================
+    # FED POLICY SCORE
+    # Persistent.
+    # =====================================================
 
-        bias = (
-            "BULLISH FOR GOLD"
+    policy_events = [
+
+        event
+
+        for event
+        in scored_events
+
+        if abs(
+            event[
+                "policy_impact"
+            ]
+        ) > 0.01
+    ]
+
+
+    policy_total = sum(
+
+        event[
+            "policy_impact"
+        ]
+
+        for event
+        in policy_events[:20]
+    )
+
+
+    fed_policy_score = round(
+
+        clamp(
+            50
+            + policy_total
+        ),
+
+        1
+    )
+
+
+    # =====================================================
+    # CATEGORY + UNDERLYING ECONOMY
+    # =====================================================
+
+    categories = build_category_scores(
+        policy_events
+    )
+
+
+    underlying_score = (
+        build_underlying_score(
+            categories
+        )
+    )
+
+
+    # =====================================================
+    # FINAL ECONOMIC SCORE
+    #
+    # Policy gets largest weight because this is a
+    # Gold / Fed-oriented model.
+    # =====================================================
+
+    economic_score = round(
+
+        (
+            market_shock_score
+            * 0.25
         )
 
+        +
 
-    elif economic_score >= 54:
-
-        bias = (
-            "SLIGHTLY BULLISH"
+        (
+            fed_policy_score
+            * 0.50
         )
 
+        +
 
-    elif economic_score <= 35:
+        (
+            underlying_score
+            * 0.25
+        ),
 
-        bias = (
-            "BEARISH FOR GOLD"
-        )
-
-
-    elif economic_score <= 46:
-
-        bias = (
-            "SLIGHTLY BEARISH"
-        )
-
-
-    else:
-
-        bias = "NEUTRAL"
+        1
+    )
 
 
     result = {
@@ -1035,17 +1406,26 @@ def get_economic_monitor():
         "score":
             economic_score,
 
-        "bias":
-            bias,
+        "market_shock_score":
+            market_shock_score,
+
+        "fed_policy_score":
+            fed_policy_score,
+
+        "underlying_score":
+            underlying_score,
+
+        "categories":
+            categories,
 
         "events":
-            relevant[:10],
-
-        "event_count":
-            len(relevant),
+            scored_events[:15],
 
         "source":
             "Forex Factory",
+
+        "two_year_confirmation":
+            two_year_change_pct,
 
         "updated":
 
@@ -1062,6 +1442,10 @@ def get_economic_monitor():
     ECON_CACHE["result"] = (
         result
     )
+
+    ECON_CACHE[
+        "last_2y"
+    ] = two_year_change_pct
 
 
     return result
