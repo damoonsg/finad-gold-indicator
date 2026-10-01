@@ -1,0 +1,1 @@
+# finad-gold-indicator
