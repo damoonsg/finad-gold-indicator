@@ -35,6 +35,14 @@ FED_MAX_DOCUMENTS = 18
 FED_DOC_CHAR_LIMIT = 950
 FED_MAX_DOCS_PER_SPEAKER = 2
 
+GEO_CACHE = {"time": 0, "result": None}
+GEO_CACHE_SECONDS = 300
+GEO_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
+GEO_MAX_CANDIDATES = 20
+GEO_MAX_EVENTS = 8
+TRUMP_TRUTH_ACCOUNT_ID = "107780257626128497"
+GEO_GROQ_MODEL = os.environ.get("GEO_GROQ_MODEL", "openai/gpt-oss-20b")
+
 # Hybrid Fed stance sources: official Federal Reserve System sites are primary;
 # UtoTimes/UtoFX are secondary for timely same-day quotes/Q&A when official text
 # is not yet published. Official sources win on overlapping episodes.
@@ -2398,6 +2406,504 @@ def get_economic_monitor(two_year_change_bps=None):
     ECON_CACHE["last_2y"] = two_year_change_bps
     return result
 
+
+# =========================================================
+# GLOBAL GEOPOLITICAL RISK ENGINE
+# =========================================================
+
+# Retrieval terms are used only to find potentially relevant items. They NEVER
+# determine escalation/de-escalation direction or the score; the semantic model
+# makes that judgment from context.
+GEO_RETRIEVAL_TERMS = [
+    "war", "conflict", "military", "strike", "airstrike", "missile", "drone",
+    "troops", "deployment", "ceasefire", "peace deal", "sanctions", "nuclear",
+    "blockade", "shipping", "red sea", "strait of hormuz", "taiwan", "ukraine",
+    "russia", "iran", "israel", "gaza", "nato", "north korea", "south china sea",
+    "tariff", "trade war", "export controls", "terror attack", "coup",
+    "جنگ", "حمله", "موشک", "پهپاد", "تحریم", "آتش بس", "آتش‌بس", "صلح",
+    "هسته ای", "هسته‌ای", "تنگه هرمز", "دریای سرخ", "تایوان", "اوکراین",
+    "روسیه", "اسرائیل", "غزه", "تعرفه", "جنگ تجاری", "ناتو", "کره شمالی",
+]
+
+GEO_CREDIBILITY_DOMAINS = {
+    "reuters.com": 1.00, "apnews.com": 0.99, "bloomberg.com": 0.97,
+    "bbc.com": 0.95, "bbc.co.uk": 0.95, "ft.com": 0.95, "wsj.com": 0.94,
+    "cnbc.com": 0.90, "nytimes.com": 0.90, "washingtonpost.com": 0.90,
+    "theguardian.com": 0.87, "dw.com": 0.88, "france24.com": 0.87,
+    "aljazeera.com": 0.84, "nikkei.com": 0.92, "scmp.com": 0.80,
+    "whitehouse.gov": 0.99, "state.gov": 0.99, "defense.gov": 0.99,
+    "centcom.mil": 0.99, "nato.int": 0.99, "un.org": 0.98,
+    "truthsocial.com": 0.96, "x.com": 0.94,
+    "utotimes.com": 0.78, "t.me": 0.76,
+}
+
+GDELT_GEO_QUERY = (
+    '(war OR conflict OR missile OR airstrike OR ceasefire OR sanctions OR nuclear OR '
+    'troops OR blockade OR tariff OR "trade war" OR "Strait of Hormuz" OR "Red Sea" '
+    'OR Taiwan OR Ukraine OR Iran OR Israel OR NATO OR "North Korea")'
+)
+
+
+def _geo_parse_date(value):
+    dt = parse_date(value)
+    if dt:
+        return dt
+    raw = str(value or "").strip()
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%d%H%M%S", "%Y%m%dT%H%M%S"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    return None
+
+
+def _geo_iso(value):
+    dt = _geo_parse_date(value)
+    return dt.isoformat() if dt else None
+
+
+def _domain_credibility(domain):
+    d = str(domain or "").lower().replace("www.", "").strip()
+    for known, weight in GEO_CREDIBILITY_DOMAINS.items():
+        if d == known or d.endswith("." + known):
+            return weight
+    return 0.68
+
+
+def _geo_hours_since(value):
+    dt = _geo_parse_date(value)
+    if not dt:
+        return 999.0
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
+
+
+def _geo_decay(hours):
+    if hours <= 3:
+        return 1.00
+    if hours <= 12:
+        return 0.88
+    if hours <= 24:
+        return 0.72
+    if hours <= 48:
+        return 0.48
+    if hours <= 72:
+        return 0.30
+    if hours <= 168:
+        return 0.15
+    return 0.0
+
+
+def _looks_geopolitical(text):
+    t = normalize_text(text)
+    return any(term in t for term in GEO_RETRIEVAL_TERMS)
+
+
+def get_gdelt_geopolitical_news(limit=45):
+    """Global news radar. GDELT supplies broad worldwide coverage; AI decides relevance."""
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {
+        "query": GDELT_GEO_QUERY,
+        "mode": "artlist",
+        "format": "json",
+        "timespan": "24h",
+        "maxrecords": str(max(10, min(limit, 75))),
+        "sort": "datedesc",
+    }
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=(4, 12))
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+
+    items = []
+    for article in data.get("articles", []) if isinstance(data, dict) else []:
+        title = str(article.get("title") or "").strip()
+        link = article.get("url") or article.get("url_mobile")
+        domain = str(article.get("domain") or "").lower().replace("www.", "")
+        date = _geo_iso(article.get("seendate") or article.get("date"))
+        if not title or not link:
+            continue
+        items.append({
+            "text": title[:700],
+            "title": title[:300],
+            "date": date,
+            "link": link,
+            "source": domain or "GDELT indexed source",
+            "source_type": "GLOBAL NEWS",
+            "domain": domain,
+            "credibility": _domain_credibility(domain),
+        })
+    return items[:limit]
+
+
+def get_trump_truth_posts(limit=10):
+    """Best-effort direct public Trump Truth Social feed (Mastodon-compatible endpoint)."""
+    url = f"https://truthsocial.com/api/v1/accounts/{TRUMP_TRUTH_ACCOUNT_ID}/statuses"
+    try:
+        r = requests.get(url, params={"limit": min(limit, 20)}, headers=HEADERS, timeout=(4, 10))
+        r.raise_for_status()
+        statuses = r.json()
+    except Exception:
+        return []
+
+    result = []
+    if not isinstance(statuses, list):
+        return result
+    for s in statuses:
+        if not isinstance(s, dict) or s.get("reblog"):
+            continue
+        body = BeautifulSoup(s.get("content") or "", "html.parser").get_text(" ", strip=True)
+        if not body:
+            continue
+        result.append({
+            "text": body[:1200],
+            "title": "Donald Trump — Truth Social",
+            "date": _geo_iso(s.get("created_at")),
+            "link": s.get("url") or s.get("uri"),
+            "source": "Donald Trump — Truth Social",
+            "source_type": "DIRECT STATEMENT",
+            "domain": "truthsocial.com",
+            "credibility": 0.96,
+        })
+    return result[:limit]
+
+
+def _twitter_snowflake_date(value):
+    try:
+        millis = (int(str(value)) >> 22) + 1288834974657
+        return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def get_trump_x_posts(limit=8):
+    """Best-effort public X embedded timeline. It is supplemental and may be unavailable."""
+    url = "https://syndication.twitter.com/srv/timeline-profile/screen-name/realDonaldTrump"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=(4, 10))
+        r.raise_for_status()
+        m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S | re.I)
+        if not m:
+            return []
+        root = json.loads(m.group(1))
+    except Exception:
+        return []
+
+    found = {}
+    def walk(obj):
+        if isinstance(obj, dict):
+            txt = obj.get("full_text") or obj.get("text")
+            ident = obj.get("id_str") or obj.get("id") or obj.get("rest_id")
+            user = obj.get("user") or obj.get("author") or {}
+            screen = ""
+            if isinstance(user, dict):
+                legacy = user.get("legacy") if isinstance(user.get("legacy"), dict) else {}
+                screen = str(user.get("screen_name") or user.get("username") or legacy.get("screen_name") or "")
+            if isinstance(txt, str) and len(txt.strip()) > 15 and ident:
+                if not screen or screen.lower() == "realdonaldtrump":
+                    iid = str(ident)
+                    date = obj.get("created_at") or obj.get("createdAt") or _twitter_snowflake_date(iid)
+                    found[iid] = {
+                        "text": txt.strip()[:1200],
+                        "title": "Donald Trump — X",
+                        "date": _geo_iso(date),
+                        "link": f"https://x.com/realDonaldTrump/status/{iid}",
+                        "source": "Donald Trump — X",
+                        "source_type": "DIRECT STATEMENT",
+                        "domain": "x.com",
+                        "credibility": 0.94,
+                    }
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+    walk(root)
+    items = list(found.values())
+    items.sort(key=lambda x: _geo_parse_date(x.get("date")) or datetime(2000,1,1,tzinfo=timezone.utc), reverse=True)
+    return items[:limit]
+
+
+def _uto_geo_candidates(telegram_news, utotimes_news):
+    result = []
+    for item in telegram_news:
+        text = item.get("text") or ""
+        if not _looks_geopolitical(text):
+            continue
+        result.append({
+            "text": text[:1200], "title": text[:260], "date": _geo_iso(item.get("date")),
+            "link": item.get("link"), "source": "UtoFX Telegram", "source_type": "UTO",
+            "domain": "t.me", "credibility": 0.76,
+        })
+    for item in utotimes_news:
+        title = item.get("title") or ""
+        body = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
+        combined = f"{title} {body}".strip()
+        if not _looks_geopolitical(combined):
+            continue
+        result.append({
+            "text": combined[:1200], "title": title[:300], "date": _geo_iso(item.get("date")),
+            "link": item.get("link"), "source": "UtoTimes", "source_type": "UTO",
+            "domain": "utotimes.com", "credibility": 0.78,
+        })
+    return result
+
+
+def _dedupe_geo_candidates(items):
+    ordered = sorted(
+        items,
+        key=lambda x: (_geo_parse_date(x.get("date")) or datetime(2000,1,1,tzinfo=timezone.utc), x.get("credibility",0)),
+        reverse=True,
+    )
+    unique = []
+    for item in ordered:
+        key = normalize_text(item.get("text") or "")[:500]
+        if not key:
+            continue
+        duplicate = False
+        for old in unique:
+            oldkey = normalize_text(old.get("text") or "")[:500]
+            if key == oldkey or SequenceMatcher(None, key[:260], oldkey[:260]).ratio() >= 0.90:
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append(item)
+    return unique
+
+
+def _select_geo_candidates(items, limit=GEO_MAX_CANDIDATES):
+    """Balance direct statements, high-quality wires and broad global coverage."""
+    direct = [x for x in items if x.get("source_type") == "DIRECT STATEMENT" and _looks_geopolitical(x.get("text"))]
+    trusted = [x for x in items if x.get("source_type") == "GLOBAL NEWS" and x.get("credibility",0) >= 0.87]
+    other = [x for x in items if x not in direct and x not in trusted]
+    result = []
+    for bucket, cap in ((direct, 5), (trusted, 10), (other, limit)):
+        for x in bucket:
+            if x not in result:
+                result.append(x)
+            if len([y for y in result if y in bucket]) >= cap or len(result) >= limit:
+                break
+        if len(result) >= limit:
+            break
+    return result[:limit]
+
+
+def _geo_fingerprint(items):
+    payload = [{"text":x.get("text"),"date":x.get("date"),"source":x.get("source")} for x in items]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _groq_geopolitical_analysis(candidates):
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    docs=[]
+    for i,c in enumerate(candidates,1):
+        docs.append({
+            "id": i, "date": c.get("date"), "source": c.get("source"),
+            "source_type": c.get("source_type"), "credibility": round(float(c.get("credibility",0.68)),2),
+            "headline_or_text": (c.get("text") or "")[:1200],
+        })
+
+    system_prompt = """You are a global geopolitical-risk analyst for a GOLD macro dashboard.
+Read the supplied items semantically. Do NOT score by keyword counts. The task is to identify DISTINCT current geopolitical events worldwide that can matter to gold, the U.S. dollar, rates, oil, or global risk appetite.
+
+Coverage is GLOBAL: Middle East, Russia/Ukraine, Europe/NATO, China/Taiwan/South China Sea, Koreas, India/Pakistan, trade wars/tariffs/export controls, sanctions, nuclear risks, shipping chokepoints, terrorism/security, coups/major instability, and major diplomatic de-escalation.
+
+Critical rules:
+1. MERGE duplicate reports of the same real-world event into one event. More sources increase confidence, not event count.
+2. Distinguish a STATEMENT/THREAT from PREPARATION and from a CONFIRMED_ACTION/ACTIVE_CONFLICT. A politician's post is evidence of what they said, not proof that an action happened.
+3. Direct Trump X/Truth posts are important public statements. If a claim of action is not independently supported by another supplied source, do not upgrade it to confirmed action solely because the post says it happened.
+4. Official/major-wire reporting has higher evidentiary value for confirming actions. Uto is useful secondary reporting.
+5. DE-ESCALATION (ceasefire, credible negotiations, withdrawal, sanctions relief, peace agreement) must receive negative direction for gold geopolitical risk when materially important.
+6. Ignore routine domestic politics, ordinary crime, sports, culture, or items with negligible global gold relevance.
+7. Evaluate current market relevance, not moral importance.
+
+For each distinct event return:
+- event_key: short unique label
+- summary: concise factual 1-2 sentence summary
+- region: short region/country pair
+- category: one of MILITARY, NUCLEAR, SANCTIONS, TRADE, SHIPPING, TERROR_SECURITY, POLITICAL_INSTABILITY, DIPLOMACY, ENERGY_SECURITY, OTHER
+- direction: ESCALATION, DE_ESCALATION, or NEUTRAL
+- stage: STATEMENT, THREAT, PREPARATION, CONFIRMED_ACTION, ACTIVE_CONFLICT, DIPLOMATIC_ACTION, CEASEFIRE_DEAL, SANCTIONS_ACTION, TRADE_ACTION
+- severity: 0-100
+- gold_relevance: 0-100
+- oil_relevance: 0-100
+- confidence: 0-100
+- input_ids: list of supplied document IDs supporting the event
+
+Return ONLY valid JSON: {"events":[...]}.
+Return at most 8 events, prioritizing gold relevance and recency. Do not invent facts beyond the supplied items."""
+
+    payload={
+        "model": GEO_GROQ_MODEL,
+        "messages":[
+            {"role":"system","content":system_prompt},
+            {"role":"user","content":json.dumps({"items":docs},ensure_ascii=False)},
+        ],
+        "temperature":0.1,
+        "max_tokens":1500,
+        "response_format":{"type":"json_object"},
+    }
+    headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"}
+    r=requests.post(GROQ_API_URL,headers=headers,json=payload,timeout=(5,25))
+    if r.status_code == 429:
+        raise RuntimeError("GROQ RATE LIMIT")
+    r.raise_for_status()
+    parsed=_parse_json_object(r.json()["choices"][0]["message"]["content"])
+    events=parsed.get("events")
+    if not isinstance(events,list):
+        raise ValueError("Geo AI response missing events array")
+    return events[:GEO_MAX_EVENTS]
+
+
+def _score_geopolitical_events(candidates, ai_events):
+    by_id={i+1:c for i,c in enumerate(candidates)}
+    stage_mult={
+        "STATEMENT":0.30, "THREAT":0.48, "PREPARATION":0.68,
+        "CONFIRMED_ACTION":0.88, "ACTIVE_CONFLICT":1.00,
+        "DIPLOMATIC_ACTION":0.58, "CEASEFIRE_DEAL":0.92,
+        "SANCTIONS_ACTION":0.72, "TRADE_ACTION":0.68,
+    }
+    events=[]
+    net=0.0
+    for e in ai_events:
+        try:
+            direction=str(e.get("direction") or "NEUTRAL").upper()
+            sign=1 if direction=="ESCALATION" else (-1 if direction=="DE_ESCALATION" else 0)
+            sev=clamp(float(e.get("severity",0)))
+            rel=clamp(float(e.get("gold_relevance",0)))
+            conf=clamp(float(e.get("confidence",50)))
+            ids=[]
+            for raw in e.get("input_ids") or []:
+                try:
+                    iid=int(raw)
+                    if iid in by_id and iid not in ids:
+                        ids.append(iid)
+                except Exception:
+                    pass
+            if not ids or rel < 15:
+                continue
+            src=[by_id[i] for i in ids]
+            latest=min((_geo_hours_since(x.get("date")) for x in src), default=999)
+            decay=_geo_decay(latest)
+            cred=max((float(x.get("credibility",0.68)) for x in src),default=0.68)
+            cred=min(1.0,cred+0.025*max(0,len(src)-1))
+            stage=str(e.get("stage") or "STATEMENT").upper()
+            mult=stage_mult.get(stage,0.50)
+            impact=sign*8.0*(sev/100)*(rel/100)*(conf/100)*mult*cred*decay
+            impact=max(-8.0,min(8.0,impact))
+            net+=impact
+            primary=max(src,key=lambda x: float(x.get("credibility",0.68)))
+            events.append({
+                "event_key":str(e.get("event_key") or e.get("summary") or "Event")[:100],
+                "summary":str(e.get("summary") or "")[:520],
+                "region":str(e.get("region") or "Global")[:80],
+                "category":str(e.get("category") or "OTHER")[:40].upper(),
+                "direction":direction,
+                "stage":stage,
+                "severity":round(sev,0),
+                "gold_relevance":round(rel,0),
+                "oil_relevance":round(clamp(float(e.get("oil_relevance",0))),0),
+                "confidence":round(conf,0),
+                "impact":round(impact,2),
+                "source_count":len(src),
+                "sources":[x.get("source") for x in src[:4]],
+                "link":primary.get("link"),
+                "date":primary.get("date"),
+            })
+        except Exception:
+            continue
+
+    score=clamp(50+net,5,95)
+    events.sort(key=lambda x:(abs(x.get("impact",0)),x.get("severity",0)),reverse=True)
+    if score>=80:
+        regime="EXTREME GLOBAL RISK — STRONG SUPPORT FOR GOLD"
+    elif score>=65:
+        regime="HIGH GLOBAL RISK — SUPPORTIVE FOR GOLD"
+    elif score>=55:
+        regime="ELEVATED GLOBAL RISK — MILD SUPPORT FOR GOLD"
+    elif score<=35:
+        regime="STRONG DE-ESCALATION — HEADWIND FOR GOLD"
+    elif score<=45:
+        regime="DE-ESCALATING — MILD HEADWIND FOR GOLD"
+    else:
+        regime="BALANCED / NEUTRAL"
+    escalating=sum(1 for e in events if e["direction"]=="ESCALATION")
+    deescalating=sum(1 for e in events if e["direction"]=="DE_ESCALATION")
+    return {
+        "score":round(score,1), "regime":regime, "events":events[:GEO_MAX_EVENTS],
+        "event_count":len(events), "escalating":escalating, "deescalating":deescalating,
+        "net_impact":round(net,2),
+    }
+
+
+def get_geopolitical_monitor(telegram_news, utotimes_news):
+    now=time.time()
+    if GEO_CACHE["result"] is not None and now-GEO_CACHE["time"]<GEO_CACHE_SECONDS:
+        return GEO_CACHE["result"]
+
+    # Fetch independent global sources concurrently so one slow provider cannot block the others.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fg=pool.submit(get_gdelt_geopolitical_news,45)
+        ft=pool.submit(get_trump_truth_posts,10)
+        fx=pool.submit(get_trump_x_posts,8)
+        try: gdelt=fg.result()
+        except Exception: gdelt=[]
+        try: truth=ft.result()
+        except Exception: truth=[]
+        try: xposts=fx.result()
+        except Exception: xposts=[]
+
+    uto=_uto_geo_candidates(telegram_news,utotimes_news)
+    all_items=_dedupe_geo_candidates(gdelt+truth+xposts+uto)
+    candidates=_select_geo_candidates(all_items,GEO_MAX_CANDIDATES)
+
+    source_stats={
+        "gdelt":len(gdelt), "truth":len(truth), "x":len(xposts), "uto":len(uto),
+        "candidates":len(candidates),
+    }
+
+    if not candidates:
+        result={
+            "score":50.0,"regime":"NO CURRENT GEO DATA","events":[],"event_count":0,
+            "escalating":0,"deescalating":0,"net_impact":0.0,"status":"NO CANDIDATES",
+            "source_stats":source_stats,
+        }
+        GEO_CACHE["time"]=now; GEO_CACHE["result"]=result
+        return result
+
+    fingerprint=_geo_fingerprint(candidates)
+    if GEO_AI_CACHE.get("fingerprint")==fingerprint and GEO_AI_CACHE.get("result"):
+        result=GEO_AI_CACHE["result"]
+        GEO_CACHE["time"]=now; GEO_CACHE["result"]=result
+        return result
+
+    try:
+        ai_events=_groq_geopolitical_analysis(candidates)
+        result=_score_geopolitical_events(candidates,ai_events)
+        result["status"]="OK"
+        result["source_stats"]=source_stats
+        result["candidate_count"]=len(candidates)
+        result["ai_event_count"]=len(ai_events)
+        GEO_AI_CACHE.update({"fingerprint":fingerprint,"result":result,"time":now})
+    except Exception as exc:
+        previous=GEO_AI_CACHE.get("result")
+        if previous:
+            result=dict(previous); result["status"]="USING LAST AI RESULT"
+        else:
+            result={
+                "score":50.0,"regime":"AI TEMPORARILY UNAVAILABLE","events":[],"event_count":0,
+                "escalating":0,"deescalating":0,"net_impact":0.0,"status":"AI TEMPORARILY UNAVAILABLE",
+                "error":str(exc)[:220],"source_stats":source_stats,
+            }
+
+    GEO_CACHE["time"]=now; GEO_CACHE["result"]=result
+    return result
+
+
 # =========================================================
 # GOLD SCORE ENGINE
 # =========================================================
@@ -2456,7 +2962,7 @@ def calculate_rates_engine(markets):
     }
 
 
-def calculate_scores(markets, fed_score, economic_score):
+def calculate_scores(markets, fed_score, economic_score, geopolitical_score):
     gold_change = markets["gold"].get("change_pct") or 0
     dxy_change = markets["dxy"].get("change_pct") or 0
     oil_change = markets["oil"].get("change_pct") or 0
@@ -2476,7 +2982,7 @@ def calculate_scores(markets, fed_score, economic_score):
         "Federal Reserve": round(fed_score, 1),
         "Rates": round(rates_score, 1),
         "US Dollar": round(dollar_score, 1),
-        "Geopolitical Risk": 50.0,
+        "Geopolitical Risk": round(geopolitical_score, 1),
         "Oil / Inflation": round(oil_score, 1),
         "Market Flow": round(market_flow_score, 1),
         "Technical": round(technical_score, 1),
@@ -2544,10 +3050,11 @@ def build_dashboard_data():
         else None
     )
     economic = get_economic_monitor(two_year_confirmation_bps)
-    score, bias, components, rates_engine = calculate_scores(markets, fed["score"], economic["score"])
+    geopolitical = get_geopolitical_monitor(telegram_news, utotimes_news)
+    score, bias, components, rates_engine = calculate_scores(markets, fed["score"], economic["score"], geopolitical["score"])
     data = {
         "score": score, "bias": bias, "components": components, "markets": markets,
-        "rates": rates_engine, "economic": economic, "fed": fed, "telegram_news": telegram_news[:8],
+        "rates": rates_engine, "economic": economic, "fed": fed, "geopolitical": geopolitical, "telegram_news": telegram_news[:8],
         "utotimes_news": utotimes_news[:5],
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
@@ -2598,6 +3105,7 @@ def _initial_dashboard_data():
             "events": [], "event_count": 0,
         },
         "fed": {"score": 50.0, "events": [], "event_count": 0, "average_stance": 0.0, "mode": "AI SEMANTIC", "model": GROQ_MODEL, "status": "INITIALIZING"},
+        "geopolitical": {"score": 50.0, "regime": "INITIALIZING", "events": [], "event_count": 0, "escalating": 0, "deescalating": 0, "net_impact": 0.0, "status": "INITIALIZING", "source_stats": {}},
         "telegram_news": [], "utotimes_news": [],
         "updated": "Waiting for first data refresh…",
         "initializing": True,
@@ -2710,6 +3218,37 @@ def dashboard():
 {% if data.economic.events %}{% for event in data.economic.events[:10] %}<div class="news-item"><div style="font-weight:bold">{{ event.name }}</div><div class="note">Actual: <strong>{{ event.actual }}</strong> &nbsp;|&nbsp; Forecast: <strong>{{ event.forecast }}</strong> &nbsp;|&nbsp; Previous: <strong>{{ event.previous }}</strong></div>{% if event.previous_original != '-' or event.revision_delta is not none %}<div class="note">Previous originally reported: <strong>{{ event.previous_original }}</strong> &nbsp;|&nbsp; Previous revised: <strong>{{ event.previous_revised }}</strong> &nbsp;|&nbsp; Revision Gold Impact: <strong class="{% if event.revision_impact>0 %}positive{% elif event.revision_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.revision_impact>0 %}+{% endif %}{{ event.revision_impact }}</strong></div>{% endif %}<div class="note">Immediate Gold Impact: <strong class="{% if event.immediate_impact>0 %}positive{% elif event.immediate_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.immediate_impact>0 %}+{% endif %}{{ event.immediate_impact }}</strong> &nbsp;|&nbsp; Fed Policy Impact: <strong class="{% if event.policy_impact>0 %}positive{% elif event.policy_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.policy_impact>0 %}+{% endif %}{{ event.policy_impact }}</strong></div><div class="note">2Y Confirmation: <strong>{{ event.confirmation }}</strong> &nbsp;|&nbsp; Category: {{ event.category }} &nbsp;|&nbsp; Source: {{ event.source }}</div></div>{% endfor %}{% else %}<div class="note">No parsed U.S. releases yet.</div>{% endif %}
 </div>
 
+<div class="section-title">Global Geopolitical Risk Monitor</div>
+<div class="components">
+<div class="component"><div class="component-name">Geopolitical Score</div><div class="component-score">{{ data.geopolitical.score }} <span style="font-size:14px;color:#697282">/100</span></div></div>
+<div class="component"><div class="component-name">Active Events</div><div class="component-score">{{ data.geopolitical.event_count }}</div></div>
+<div class="component"><div class="component-name">Escalating</div><div class="component-score">{{ data.geopolitical.escalating }}</div></div>
+<div class="component"><div class="component-name">De-escalating</div><div class="component-score">{{ data.geopolitical.deescalating }}</div></div>
+<div class="component"><div class="component-name">Net Gold Impact</div><div class="component-score">{% if data.geopolitical.net_impact>0 %}+{% endif %}{{ data.geopolitical.net_impact }}</div></div>
+</div>
+<div class="panel" style="margin-top:12px;margin-bottom:12px">
+<div class="news-title">{{ data.geopolitical.regime }}</div>
+<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT global news: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates analyzed: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong></div>
+{% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
+</div>
+<div class="fed-grid">
+{% if data.geopolitical.events %}
+{% for event in data.geopolitical.events %}
+<div class="fed-card">
+{% if event.link %}<a href="{{ event.link }}" target="_blank">{% endif %}
+<div class="fed-top"><div class="speaker">{{ event.region }}</div><div class="badge">{{ event.category }}</div></div>
+{% set geoclass='tone-hawkish' if event.direction=='ESCALATION' else ('tone-dovish' if event.direction=='DE_ESCALATION' else '') %}
+<div class="tone {{ geoclass }}">{{ event.direction }} • {{ event.stage }}</div>
+<div class="impact">Severity: {{ event.severity }}/100 • Gold relevance: {{ event.gold_relevance }}/100 • Confidence: {{ event.confidence }}% • Gold impact: {% if event.impact>0 %}+{% endif %}{{ event.impact }}</div>
+<div class="event-title" style="margin-top:8px">{{ event.summary }}</div>
+<div class="note" style="margin-top:8px">Sources: {{ event.source_count }} • {% for s in event.sources %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
+<div class="news-meta">{{ event.date or '' }}</div>
+{% if event.link %}</a>{% endif %}
+</div>
+{% endfor %}
+{% else %}<div class="panel"><div class="note">No material global geopolitical event has been scored yet.</div></div>{% endif %}
+</div>
+
 <div class="section-title">Fed Monitor — Semantic Reading of Latest Stance</div>
 <div class="panel" style="margin-bottom:12px">
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
@@ -2740,7 +3279,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Score is global: GDELT worldwide news + Trump Truth/X direct statements + Uto secondary reporting. AI clusters duplicate coverage into one event, separates statements/threats from confirmed actions, and applies recency decay.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
