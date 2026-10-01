@@ -31,8 +31,8 @@ FED_CACHE_SECONDS = 300
 FED_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-FED_MAX_DOCUMENTS = 12
-FED_DOC_CHAR_LIMIT = 1800
+FED_MAX_DOCUMENTS = 18
+FED_DOC_CHAR_LIMIT = 950
 FED_MAX_DOCS_PER_SPEAKER = 2
 
 # Hybrid Fed stance sources: official Federal Reserve System sites are primary;
@@ -1393,67 +1393,101 @@ def _policy_excerpt(text, title="", max_chars=FED_DOC_CHAR_LIMIT):
     excerpt = (core + separator + tail).strip()
     return excerpt[:max_chars]
 
-def _groq_semantic_fed_analysis(documents):
-    """One compact semantic request for the current official Fed documents.
+def _fed_speaker_bundles(documents):
+    """Group recent candidate documents by speaker before asking the LLM.
 
-    The previous version sent several large batches back-to-back. On Groq's free
-    tier that could exceed TPM and make the entire Fed monitor disappear. This
-    version makes one request and sends compact policy-context excerpts only.
+    The model should make ONE stance decision per speaker after comparing the
+    speaker's latest official Fed material with any timely Uto quote/Q&A. This is
+    both more accurate and much smaller than asking for one output per document.
+    """
+    grouped = {}
+    for doc in documents[:FED_MAX_DOCUMENTS]:
+        speaker = doc.get("speaker")
+        if not speaker:
+            continue
+        grouped.setdefault(speaker, []).append(doc)
+
+    bundles = []
+    for speaker, docs in grouped.items():
+        docs = sorted(
+            docs,
+            key=lambda x: parse_date(x.get("date")) or datetime(2000, 1, 1, tzinfo=timezone.utc),
+            reverse=True,
+        )[:FED_MAX_DOCS_PER_SPEAKER]
+        bundles.append({"speaker": speaker, "documents": docs})
+
+    bundles.sort(
+        key=lambda b: parse_date(b["documents"][0].get("date")) if b.get("documents") else datetime(2000, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return bundles
+
+
+def _groq_semantic_fed_analysis(documents):
+    """Analyze one compact bundle per speaker in a single Groq request.
+
+    v9 sent 12 document-level items and the model sometimes returned only a few
+    analyses. v10 asks for exactly one result per SPEAKER bundle and validates
+    that every bundle came back before a score is accepted.
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not configured")
 
-    system_prompt = """You are a monetary-policy research analyst. Analyze Federal Reserve communications by meaning and policy intent, not keyword counts.
+    bundles = _fed_speaker_bundles(documents)
+    if not bundles:
+        return [], []
 
-Items may come from either (1) official Federal Reserve System websites or (2) UtoFX/UtoTimes as secondary reporting. Official Federal Reserve sources are authoritative and must be preferred when there is any conflict. Uto sources can be used for timely quotes/Q&A when an official transcript is not yet available. The text may be a compact excerpt. Read context and meaning; never score by word frequency.
+    system_prompt = """You are a Federal Reserve monetary-policy analyst. Read meaning, not keyword counts.
 
-For each item:
-- decide whether it materially communicates the speaker's CURRENT monetary-policy stance;
-- distinguish economic observations from the speaker's policy preference;
-- give highest weight to forward-looking guidance about the NEXT policy move;
-- treat a prior vote/hike/cut as historical context unless the speaker links it to what should happen next;
-- inflation concern alone does not automatically make the overall stance hawkish;
-- patience / more time / more data / no urgency generally pulls the overall stance toward neutral unless another near-term hike is clearly advocated;
-- if the item is about data systems, regulation, cybersecurity, community issues, or another topic without meaningful policy guidance, set policy_relevant=false.
-- if policy_relevant_hint=true, the OFFICIAL TITLE itself clearly identifies a monetary-policy/economic-outlook speech. Treat it as policy_relevant unless the supplied text is obviously a parser mismatch. Do not reject it merely because the excerpt is compact.
+Each item is ONE Fed speaker and may contain up to two recent source documents: official Federal Reserve System material and/or UtoFX/UtoTimes reporting. Decide the speaker's latest CURRENT monetary-policy stance after considering all supplied documents together.
 
-stance_score scale:
--2.0 strongly dovish
--1.0 dovish
--0.5 slightly dovish / pause-easing bias
- 0.0 neutral / balanced / patient / unclear
-+0.5 slightly hawkish / tightening bias
-+1.0 hawkish / clear preference for another hike relatively soon
-+2.0 strongly hawkish / urgent tightening
+Rules:
+1. Forward guidance about the NEXT rate move has the highest weight.
+2. A prior hike/cut/vote is historical context unless the speaker links it to the next move.
+3. Inflation concern alone does not make the overall stance hawkish.
+4. "More time", "wait for data", "no urgency", or similar patience language normally means neutral/slightly dovish unless another near-term hike is clearly advocated.
+5. If an official source and Uto describe the SAME episode and conflict, prefer the official source. But an unrelated official speech must NOT suppress a newer policy-relevant Uto quote/Q&A.
+6. If none of the supplied documents gives meaningful current policy guidance, set policy_relevant=false.
+7. Never increase hawkish/dovish strength because a phrase is repeated.
+
+stance_score: -2 strongly dovish, -1 dovish, -0.5 slightly dovish, 0 neutral, +0.5 slightly hawkish, +1 hawkish, +2 strongly hawkish.
+
+You MUST return exactly ONE analysis object for EVERY supplied item id. Never omit an id, even when policy_relevant=false. Keep summary to max 24 words.
 
 Return ONLY valid JSON:
-{"analyses":[{"id":1,"speaker":"Name","policy_relevant":true,"summary":"1-2 concise sentences","inflation_view":"...","labor_view":"...","rate_path_view":"...","stance_score":0.0,"confidence":85}]}
+{"analyses":[{"id":1,"speaker":"Name","policy_relevant":true,"selected_doc_id":1,"summary":"short factual summary","inflation_view":"NEUTRAL","labor_view":"NEUTRAL","rate_path_view":"NEUTRAL","stance_score":0.0,"confidence":85}]}
 
+selected_doc_id is the document inside that speaker bundle that best supports the current stance, or null if policy_relevant=false.
 Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DOVISH, STRONGLY DOVISH, MIXED, NOT DISCUSSED."""
 
-    docs = documents[:FED_MAX_DOCUMENTS]
-    docs_for_model=[]
-    for i, doc in enumerate(docs, 1):
-        docs_for_model.append({
-            "id": i,
-            "speaker": doc.get("speaker"),
-            "date": doc.get("date"),
-            "source": doc.get("source"),
-            "official_source": bool(doc.get("official_source")),
-            "title": doc.get("title"),
-            "policy_relevant_hint": _title_policy_relevance_hint(doc.get("title") or ""),
-            "text": _policy_excerpt(doc.get("text") or "", doc.get("title") or ""),
+    items = []
+    for bundle_id, bundle in enumerate(bundles, 1):
+        doc_items = []
+        for doc_id, doc in enumerate(bundle["documents"], 1):
+            doc_items.append({
+                "doc_id": doc_id,
+                "date": doc.get("date"),
+                "source": doc.get("source"),
+                "official_source": bool(doc.get("official_source")),
+                "title": doc.get("title"),
+                "policy_relevant_title_hint": _title_policy_relevance_hint(doc.get("title") or ""),
+                "text": _policy_excerpt(doc.get("text") or "", doc.get("title") or "", max_chars=FED_DOC_CHAR_LIMIT),
+            })
+        items.append({
+            "id": bundle_id,
+            "speaker": bundle["speaker"],
+            "documents": doc_items,
         })
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps({"documents": docs_for_model}, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps({"speaker_bundles": items}, ensure_ascii=False)},
         ],
-        "temperature": 0.1,
-        "max_tokens": 1800,
+        "temperature": 0.05,
+        "max_tokens": 2200,
         "response_format": {"type": "json_object"},
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -1468,9 +1502,27 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
     analyses = parsed.get("analyses")
     if not isinstance(analyses, list):
         raise ValueError("AI response missing analyses array")
-    return analyses
 
-def _build_semantic_fed_result(documents, analyses):
+    expected_ids = set(range(1, len(bundles) + 1))
+    returned_ids = set()
+    cleaned = []
+    for a in analyses:
+        try:
+            aid = int(a.get("id"))
+        except Exception:
+            continue
+        if aid in expected_ids and aid not in returned_ids:
+            returned_ids.add(aid)
+            cleaned.append(a)
+
+    missing = sorted(expected_ids - returned_ids)
+    if missing:
+        raise RuntimeError(f"INCOMPLETE AI RESPONSE missing bundle ids {missing}")
+
+    return bundles, cleaned
+
+
+def _build_semantic_fed_result(bundles, analyses, candidate_count):
     by_id = {}
     for a in analyses:
         try:
@@ -1478,21 +1530,40 @@ def _build_semantic_fed_result(documents, analyses):
         except Exception:
             continue
 
-    # Analyze recent documents first, then keep only the latest POLICY-RELEVANT
-    # document per speaker. Irrelevant speeches must not force a neutral score.
-    candidates = []
-    for idx, doc in enumerate(documents[:FED_MAX_DOCUMENTS], 1):
-        a = by_id.get(idx)
+    events = []
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    relevant_count = 0
+
+    for bundle_id, bundle in enumerate(bundles, 1):
+        a = by_id.get(bundle_id)
         if not a:
             continue
-        policy_relevant = a.get("policy_relevant", True)
+
+        policy_relevant = a.get("policy_relevant", False)
         if isinstance(policy_relevant, str):
             policy_relevant = policy_relevant.strip().lower() in ("true", "1", "yes")
-        # Official titles such as "Economic Conditions and Monetary Policy" are
-        # unambiguously policy-relevant. AI still decides the STANCE; the title
-        # hint only prevents an erroneous relevance rejection.
-        forced_relevant = _title_policy_relevance_hint(doc.get("title") or "")
-        if not policy_relevant and not forced_relevant:
+
+        docs = bundle.get("documents") or []
+        # A clearly policy-focused official title is a relevance safety net only;
+        # it never determines hawkish/dovish direction.
+        forced_docs = [d for d in docs if d.get("official_source") and _title_policy_relevance_hint(d.get("title") or "")]
+        if not policy_relevant and not forced_docs:
+            continue
+
+        try:
+            selected_doc_id = int(a.get("selected_doc_id"))
+        except Exception:
+            selected_doc_id = None
+
+        selected_doc = None
+        if selected_doc_id and 1 <= selected_doc_id <= len(docs):
+            selected_doc = docs[selected_doc_id - 1]
+        elif forced_docs:
+            selected_doc = forced_docs[0]
+        elif docs:
+            selected_doc = docs[0]
+        if not selected_doc:
             continue
 
         try:
@@ -1504,47 +1575,13 @@ def _build_semantic_fed_result(documents, analyses):
         except Exception:
             confidence = 50.0
 
-        candidates.append((doc, a, stance, confidence))
-
-    latest = {}
-    for doc, a, stance, confidence in candidates:
-        speaker = doc.get("speaker")
-        dt = parse_date(doc.get("date"))
-        if not speaker or not dt:
-            continue
-        if speaker not in latest:
-            latest[speaker] = (doc, a, stance, confidence)
-            continue
-
-        old_doc = latest[speaker][0]
-        old_dt = parse_date(old_doc.get("date"))
-        if not old_dt:
-            latest[speaker] = (doc, a, stance, confidence)
-            continue
-
-        # If official and Uto items are effectively about the same recent episode,
-        # prefer the official Federal Reserve source. Otherwise use the newer
-        # policy-relevant statement, allowing Uto to fill a same-day transcript gap.
-        hours_apart = abs((dt - old_dt).total_seconds()) / 3600.0
-        new_official = bool(doc.get("official_source"))
-        old_official = bool(old_doc.get("official_source"))
-        if hours_apart <= 12 and new_official != old_official:
-            if new_official:
-                latest[speaker] = (doc, a, stance, confidence)
-            continue
-        if dt > old_dt:
-            latest[speaker] = (doc, a, stance, confidence)
-
-    events = []
-    weighted_sum = 0.0
-    weight_sum = 0.0
-
-    for doc, a, stance, confidence in latest.values():
+        relevant_count += 1
         confidence_weight = 0.45 + 0.55 * (confidence / 100.0)
-        recency = fed_recency_weight(doc.get("date"))
-        speaker_weight = FED_SPEAKERS.get(doc.get("speaker"), {}).get("weight", 0.75)
-        voter_weight = 1.08 if doc.get("voter") else 0.92
-        source_weight = 1.00 if doc.get("official_source") else 0.82
+        recency = fed_recency_weight(selected_doc.get("date"))
+        speaker = bundle.get("speaker")
+        speaker_weight = FED_SPEAKERS.get(speaker, {}).get("weight", 0.75)
+        voter_weight = 1.08 if selected_doc.get("voter") else 0.92
+        source_weight = 1.00 if selected_doc.get("official_source") else 0.82
         weight = speaker_weight * voter_weight * source_weight * recency * confidence_weight
 
         weighted_sum += stance * weight
@@ -1552,7 +1589,7 @@ def _build_semantic_fed_result(documents, analyses):
         gold_impact = -stance * weight
 
         events.append({
-            "speaker": doc.get("speaker"),
+            "speaker": speaker,
             "tone": _tone_from_stance(stance),
             "stance_score": round(stance, 2),
             "summary": str(a.get("summary") or "").strip()[:520],
@@ -1561,12 +1598,12 @@ def _build_semantic_fed_result(documents, analyses):
             "rate_path_view": _safe_view(a.get("rate_path_view")),
             "confidence": round(confidence, 0),
             "gold_impact": round(gold_impact, 2),
-            "source": doc.get("source"),
-            "source_type": "OFFICIAL FED" if doc.get("official_source") else "UTO SECONDARY",
-            "date": doc.get("date"),
-            "title": doc.get("title"),
-            "link": doc.get("link"),
-            "voter": doc.get("voter"),
+            "source": selected_doc.get("source"),
+            "source_type": "OFFICIAL FED" if selected_doc.get("official_source") else "UTO SECONDARY",
+            "date": selected_doc.get("date"),
+            "title": selected_doc.get("title"),
+            "link": selected_doc.get("link"),
+            "voter": selected_doc.get("voter"),
         })
 
     if weight_sum <= 0:
@@ -1581,10 +1618,11 @@ def _build_semantic_fed_result(documents, analyses):
         "score": round(score, 1),
         "events": events,
         "event_count": len(events),
-        "candidate_count": len(documents),
+        "candidate_count": candidate_count,
+        "speaker_bundle_count": len(bundles),
         "analyzed_count": len(analyses),
-        "relevant_count": len(candidates),
-        "rejected_count": max(0, len(documents) - len(candidates)),
+        "relevant_count": relevant_count,
+        "rejected_count": max(0, len(bundles) - relevant_count),
         "average_stance": round(avg_stance, 2),
         "mode": "AI SEMANTIC • FED + UTO",
         "model": GROQ_MODEL,
@@ -1679,8 +1717,8 @@ def get_fed_monitor(telegram_news, utotimes_news):
         return result
 
     try:
-        analyses = _groq_semantic_fed_analysis(documents)
-        result = _build_semantic_fed_result(documents, analyses)
+        bundles, analyses = _groq_semantic_fed_analysis(documents)
+        result = _build_semantic_fed_result(bundles, analyses, len(documents))
         result["official_discovered"] = discovered_official_count
         result["uto_discovered"] = discovered_uto_count
         result["uto_fed_items"] = len(fed_uto_items)
@@ -1702,7 +1740,7 @@ def get_fed_monitor(telegram_news, utotimes_news):
                 "average_stance": 0.0,
                 "mode": "AI SEMANTIC • FED + UTO",
                 "model": GROQ_MODEL, "source_scope": "Official Federal Reserve System sources + UtoFX/UtoTimes secondary reporting",
-                "status": ("API KEY MISSING" if "GROQ_API_KEY" in str(exc) else ("AI RATE LIMIT" if "RATE LIMIT" in str(exc) else "AI TEMPORARILY UNAVAILABLE")),
+                "status": ("API KEY MISSING" if "GROQ_API_KEY" in str(exc) else ("AI RATE LIMIT" if "RATE LIMIT" in str(exc) else ("AI INCOMPLETE RESPONSE" if "INCOMPLETE AI RESPONSE" in str(exc) else "AI TEMPORARILY UNAVAILABLE"))),
                 "error": str(exc)[:220],
             }
 
@@ -2677,7 +2715,7 @@ def dashboard():
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <span class="note"> • {{ data.fed.event_count }} latest policy stances{% if data.fed.candidate_count is defined %} from {{ data.fed.candidate_count }} recent candidate documents{% endif %} • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
-{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidates sent to AI: <strong>{{ data.fed.candidate_count }}</strong> • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
+{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidate documents: <strong>{{ data.fed.candidate_count }}</strong>{% if data.fed.speaker_bundle_count is defined %} • Speaker bundles sent to AI: <strong>{{ data.fed.speaker_bundle_count }}</strong>{% endif %} • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
 {% if data.fed.error %}<div class="note" style="color:#e6a36f">Fed engine detail: {{ data.fed.error }}</div>{% endif %}
 <div class="note">Source policy: <strong>Official Federal Reserve System sources are primary</strong>; UtoFX/UtoTimes are secondary for timely quotes/Q&amp;A. If sources conflict, the official Fed source wins.</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
@@ -2702,7 +2740,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI semantically determines relevance and stance; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
