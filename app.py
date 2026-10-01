@@ -253,6 +253,28 @@ def yahoo_market(symbol):
         return {"price": None, "previous": None, "change": None, "change_pct": None, "ok": False}
 
 
+
+def treasury_yield_market(symbol):
+    """Fetch a Treasury yield quote and express the session move in basis points.
+
+    Yahoo yield-style symbols are quoted in percentage points, e.g. 4.42 means
+    4.42%. Therefore a move from 4.42 to 4.47 is +5 basis points.
+    """
+    data = yahoo_market(symbol)
+
+    price = data.get("price")
+    previous = data.get("previous")
+
+    change_bps = None
+    if price is not None and previous is not None:
+        try:
+            change_bps = (float(price) - float(previous)) * 100.0
+        except Exception:
+            change_bps = None
+
+    data["change_bps"] = safe_round(change_bps, 1)
+    return data
+
 def xau_spot_market():
     """Fetch live XAU/USD spot from XAUS.com (free, no API key).
 
@@ -795,24 +817,45 @@ def impact_weight(value):
     return 0.65
 
 
-def session_yield_confirmation(policy_signal, two_year_change_pct, event_date):
+def session_yield_confirmation(policy_signal, two_year_change_bps, event_date):
+    """Use the 2Y session move as confirmation, measured in basis points.
+
+    The economic release creates the signal. The 2Y move only confirms or
+    weakens it. We apply this only to releases from the last six hours.
+    """
     hours = hours_since(event_date)
-    if hours is None or hours > 6 or two_year_change_pct is None or abs(policy_signal) < 0.10:
+
+    if (
+        hours is None
+        or hours > 6
+        or two_year_change_bps is None
+        or abs(policy_signal) < 0.10
+    ):
         return {"status": "NOT APPLIED", "multiplier": 1.00}
+
+    try:
+        bps = float(two_year_change_bps)
+    except Exception:
+        return {"status": "NOT APPLIED", "multiplier": 1.00}
+
+    # Dovish / gold-positive data should generally pull the 2Y yield lower.
     if policy_signal > 0:
-        if two_year_change_pct < -0.05:
+        if bps <= -2.0:
             return {"status": "CONFIRMED", "multiplier": 1.15}
-        if two_year_change_pct > 0.05:
+        if bps >= 2.0:
             return {"status": "REJECTED BY 2Y", "multiplier": 0.70}
+
+    # Hawkish / gold-negative data should generally push the 2Y yield higher.
     else:
-        if two_year_change_pct > 0.05:
+        if bps >= 2.0:
             return {"status": "CONFIRMED", "multiplier": 1.15}
-        if two_year_change_pct < -0.05:
+        if bps <= -2.0:
             return {"status": "REJECTED BY 2Y", "multiplier": 0.70}
+
     return {"status": "NOT CONFIRMED", "multiplier": 0.90}
 
 
-def score_release(profile, actual, forecast, previous, date, impact, source, link, two_year_change_pct):
+def score_release(profile, actual, forecast, previous, date, impact, source, link, two_year_change_bps):
     if actual is None:
         return None
     basis = None
@@ -833,7 +876,7 @@ def score_release(profile, actual, forecast, previous, date, impact, source, lin
     immediate = gold_direction_signal * profile["immediate_weight"] * imp * confidence * immediate_decay(date)
     immediate = max(-10, min(10, immediate))
     raw_policy = gold_direction_signal * profile["policy_weight"] * imp * confidence * policy_decay(date, profile["persistence_hours"])
-    confirmation = session_yield_confirmation(raw_policy, two_year_change_pct, date)
+    confirmation = session_yield_confirmation(raw_policy, two_year_change_bps, date)
     policy = max(-10, min(10, raw_policy * confirmation["multiplier"]))
     return {
         "name": profile["name"], "category": profile["category"],
@@ -847,7 +890,7 @@ def score_release(profile, actual, forecast, previous, date, impact, source, lin
     }
 
 
-def extract_releases_from_article(article, ff_events, two_year_change_pct):
+def extract_releases_from_article(article, ff_events, two_year_change_bps):
     text = article.get("text", "")
     date = article.get("date")
     results = []
@@ -869,7 +912,7 @@ def extract_releases_from_article(article, ff_events, two_year_change_pct):
             impact = ff_match.get("impact")
         else:
             impact = "Medium"
-        scored = score_release(profile, actual, forecast, previous, date, impact, "UtoTimes", article.get("link"), two_year_change_pct)
+        scored = score_release(profile, actual, forecast, previous, date, impact, "UtoTimes", article.get("link"), two_year_change_bps)
         if scored:
             results.append(scored)
     return results
@@ -896,15 +939,15 @@ def build_category_scores(events):
     return categories
 
 
-def get_economic_monitor(two_year_change_pct=None):
+def get_economic_monitor(two_year_change_bps=None):
     now = time.time()
-    if ECON_CACHE["result"] is not None and now - ECON_CACHE["time"] < ECON_CACHE_SECONDS and ECON_CACHE["last_2y"] == two_year_change_pct:
+    if ECON_CACHE["result"] is not None and now - ECON_CACHE["time"] < ECON_CACHE_SECONDS and ECON_CACHE["last_2y"] == two_year_change_bps:
         return ECON_CACHE["result"]
     ff_events = fetch_ff_calendar()
     articles = get_economic_articles(24)
     scored = []
     for article in articles:
-        scored.extend(extract_releases_from_article(article, ff_events, two_year_change_pct))
+        scored.extend(extract_releases_from_article(article, ff_events, two_year_change_bps))
     scored = dedupe_releases(scored)
     active_policy = [e for e in scored if abs(e["policy_impact"]) > 0.01]
     active_immediate = [e for e in scored if abs(e["immediate_impact"]) > 0.01]
@@ -921,7 +964,7 @@ def get_economic_monitor(two_year_change_pct=None):
     }
     ECON_CACHE["time"] = now
     ECON_CACHE["result"] = result
-    ECON_CACHE["last_2y"] = two_year_change_pct
+    ECON_CACHE["last_2y"] = two_year_change_bps
     return result
 
 # =========================================================
@@ -1142,7 +1185,7 @@ def ff_impact_for_profile(profile, event_date, ff_events):
 
 
 def score_release_v2(profile, actual, forecast, previous, date, impact, source, link,
-                     two_year_change_pct, previous_original=None, previous_revised=None,
+                     two_year_change_bps, previous_original=None, previous_revised=None,
                      revision_delta=None):
     if actual is None:
         return None
@@ -1170,7 +1213,7 @@ def score_release_v2(profile, actual, forecast, previous, date, impact, source, 
 
     immediate = max(-10, min(10, immediate_main + revision_immediate))
     raw_policy = policy_main + revision_policy
-    confirmation = session_yield_confirmation(raw_policy, two_year_change_pct, date)
+    confirmation = session_yield_confirmation(raw_policy, two_year_change_bps, date)
     policy = max(-10, min(10, raw_policy * confirmation["multiplier"]))
 
     return {
@@ -1188,7 +1231,7 @@ def score_release_v2(profile, actual, forecast, previous, date, impact, source, 
     }
 
 
-def extract_releases_from_article(article, ff_events, two_year_change_pct):
+def extract_releases_from_article(article, ff_events, two_year_change_bps):
     results = []
     used = set()
     combined = f"{article.get('title','')} {article.get('text','')}"
@@ -1218,7 +1261,7 @@ def extract_releases_from_article(article, ff_events, two_year_change_pct):
 
         scored = score_release_v2(
             profile, actual, forecast, previous, article.get("date"), impact,
-            "UtoTimes", article.get("link"), two_year_change_pct,
+            "UtoTimes", article.get("link"), two_year_change_bps,
             previous_original=previous_original, previous_revised=previous_revised,
             revision_delta=revision_delta,
         )
@@ -1228,7 +1271,7 @@ def extract_releases_from_article(article, ff_events, two_year_change_pct):
     return results
 
 
-def get_economic_monitor(two_year_change_pct=None):
+def get_economic_monitor(two_year_change_bps=None):
     now = time.time()
     if ECON_CACHE["result"] is not None and now - ECON_CACHE["time"] < ECON_CACHE_SECONDS:
         return ECON_CACHE["result"]
@@ -1237,7 +1280,7 @@ def get_economic_monitor(two_year_change_pct=None):
     articles = get_economic_articles(24)
     scored = []
     for article in articles:
-        scored.extend(extract_releases_from_article(article, ff_events, two_year_change_pct))
+        scored.extend(extract_releases_from_article(article, ff_events, two_year_change_bps))
     scored = dedupe_releases(scored)
 
     active_policy = [e for e in scored if abs(e["policy_impact"]) > 0.01]
@@ -1257,7 +1300,7 @@ def get_economic_monitor(two_year_change_pct=None):
     }
     ECON_CACHE["time"] = now
     ECON_CACHE["result"] = result
-    ECON_CACHE["last_2y"] = two_year_change_pct
+    ECON_CACHE["last_2y"] = two_year_change_bps
     return result
 
 # =========================================================
@@ -1265,20 +1308,74 @@ def get_economic_monitor(two_year_change_pct=None):
 # =========================================================
 
 
+def calculate_rates_engine(markets):
+    """Convert Treasury yield moves to basis points and score their gold impact.
+
+    Weighting:
+      2Y  = 50%  (most sensitive to the expected Fed path)
+      10Y = 35%  (important for the opportunity cost of holding gold)
+      30Y = 15%  (long-duration inflation/fiscal signal)
+
+    Positive weighted bps = yields rising = headwind for gold.
+    Negative weighted bps = yields falling = support for gold.
+    """
+
+    y2 = markets["us2y"].get("change_bps")
+    y10 = markets["us10y"].get("change_bps")
+    y30 = markets["us30y"].get("change_bps")
+
+    # If a quote is temporarily unavailable, use zero for the weighted score
+    # but preserve None in the dashboard so the missing data is visible.
+    y2_calc = float(y2) if y2 is not None else 0.0
+    y10_calc = float(y10) if y10 is not None else 0.0
+    y30_calc = float(y30) if y30 is not None else 0.0
+
+    weighted_bps = (
+        y2_calc * 0.50
+        + y10_calc * 0.35
+        + y30_calc * 0.15
+    )
+
+    # Calibration: a +10 bp weighted move takes Rates Score from 50 to 34;
+    # a -10 bp move takes it from 50 to 66.
+    score = clamp(50 - weighted_bps * 1.60)
+
+    if weighted_bps >= 8:
+        regime = "STRONG HEADWIND FOR GOLD"
+    elif weighted_bps >= 2:
+        regime = "HEADWIND FOR GOLD"
+    elif weighted_bps <= -8:
+        regime = "STRONG SUPPORT FOR GOLD"
+    elif weighted_bps <= -2:
+        regime = "SUPPORT FOR GOLD"
+    else:
+        regime = "NEUTRAL"
+
+    return {
+        "score": round(score, 1),
+        "weighted_bps": round(weighted_bps, 1),
+        "us2y_bps": y2,
+        "us10y_bps": y10,
+        "us30y_bps": y30,
+        "regime": regime,
+    }
+
+
 def calculate_scores(markets, fed_score, economic_score):
     gold_change = markets["gold"].get("change_pct") or 0
     dxy_change = markets["dxy"].get("change_pct") or 0
-    y2_change = markets["us2y"].get("change_pct") or 0
-    y10_change = markets["us10y"].get("change_pct") or 0
-    y30_change = markets["us30y"].get("change_pct") or 0
     oil_change = markets["oil"].get("change_pct") or 0
     vix_change = markets["vix"].get("change_pct") or 0
+
     dollar_score = clamp(50 - dxy_change * 18)
-    rate_move = (y2_change + y10_change + y30_change) / 3
-    rates_score = clamp(50 - rate_move * 10)
+
+    rates_engine = calculate_rates_engine(markets)
+    rates_score = rates_engine["score"]
+
     technical_score = clamp(50 + gold_change * 12)
     market_flow_score = clamp(50 + vix_change * 1.5)
     oil_score = clamp(50 - oil_change * 3)
+
     components = {
         "Economic Data": round(economic_score, 1),
         "Federal Reserve": round(fed_score, 1),
@@ -1289,8 +1386,20 @@ def calculate_scores(markets, fed_score, economic_score):
         "Market Flow": round(market_flow_score, 1),
         "Technical": round(technical_score, 1),
     }
-    weights = {"Economic Data": 0.20, "Federal Reserve": 0.20, "Rates": 0.15, "US Dollar": 0.15, "Geopolitical Risk": 0.10, "Oil / Inflation": 0.07, "Market Flow": 0.05, "Technical": 0.08}
+
+    weights = {
+        "Economic Data": 0.20,
+        "Federal Reserve": 0.20,
+        "Rates": 0.15,
+        "US Dollar": 0.15,
+        "Geopolitical Risk": 0.10,
+        "Oil / Inflation": 0.07,
+        "Market Flow": 0.05,
+        "Technical": 0.08,
+    }
+
     total = round(sum(components[k] * weights[k] for k in components), 1)
+
     if total >= 75:
         bias = "STRONGLY BULLISH"
     elif total >= 60:
@@ -1305,7 +1414,8 @@ def calculate_scores(markets, fed_score, economic_score):
         bias = "SLIGHTLY BEARISH"
     else:
         bias = "NEUTRAL"
-    return total, bias, components
+
+    return total, bias, components, rates_engine
 
 # =========================================================
 # BUILD DASHBOARD
@@ -1317,18 +1427,22 @@ def build_dashboard_data():
     if CACHE["data"] is not None and now - CACHE["time"] < CACHE_SECONDS:
         return CACHE["data"]
     markets = {
-        "gold": xau_spot_market(), "dxy": yahoo_market("DX-Y.NYB"),
-        "us2y": yahoo_market("2YY=F"), "us10y": yahoo_market("^TNX"),
-        "us30y": yahoo_market("^TYX"), "oil": yahoo_market("CL=F"), "vix": yahoo_market("^VIX"),
+        "gold": xau_spot_market(),
+        "dxy": yahoo_market("DX-Y.NYB"),
+        "us2y": treasury_yield_market("2YY=F"),
+        "us10y": treasury_yield_market("^TNX"),
+        "us30y": treasury_yield_market("^TYX"),
+        "oil": yahoo_market("CL=F"),
+        "vix": yahoo_market("^VIX"),
     }
     telegram_news = get_utofx_news(12)
     utotimes_news = get_utotimes_news(8)
     fed = get_fed_monitor(telegram_news, utotimes_news)
-    economic = get_economic_monitor(markets["us2y"].get("change_pct"))
-    score, bias, components = calculate_scores(markets, fed["score"], economic["score"])
+    economic = get_economic_monitor(markets["us2y"].get("change_bps"))
+    score, bias, components, rates_engine = calculate_scores(markets, fed["score"], economic["score"])
     data = {
         "score": score, "bias": bias, "components": components, "markets": markets,
-        "economic": economic, "fed": fed, "telegram_news": telegram_news[:8],
+        "rates": rates_engine, "economic": economic, "fed": fed, "telegram_news": telegram_news[:8],
         "utotimes_news": utotimes_news[:5],
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
@@ -1360,8 +1474,32 @@ def dashboard():
 
 <div class="section-title">Live Markets</div><div class="market-grid">
 {% set names={'gold':'XAUUSD Spot','dxy':'DXY','us2y':'US 2Y','us10y':'US 10Y','us30y':'US 30Y','oil':'WTI Oil','vix':'VIX'} %}
-{% for key,item in data.markets.items() %}<div class="market-card"><div class="market-title">{{ names[key] }}</div><div class="market-price">{{ item.price if item.price is not none else 'N/A' }}</div>{% if item.change_pct is not none %}<div class="{% if item.change_pct>0 %}positive{% elif item.change_pct<0 %}negative{% else %}neutral{% endif %}">{% if item.change_pct>0 %}+{% endif %}{{ item.change_pct }}%</div>{% else %}<div class="neutral">Data unavailable</div>{% endif %}</div>{% endfor %}
+{% for key,item in data.markets.items() %}
+<div class="market-card">
+<div class="market-title">{{ names[key] }}</div>
+<div class="market-price">{% if item.price is not none %}{{ item.price }}{% if key in ['us2y','us10y','us30y'] %}%{% endif %}{% else %}N/A{% endif %}</div>
+{% if key in ['us2y','us10y','us30y'] %}
+    {% if item.change_bps is not none %}
+    <div class="{% if item.change_bps>0 %}negative{% elif item.change_bps<0 %}positive{% else %}neutral{% endif %}">{% if item.change_bps>0 %}+{% endif %}{{ item.change_bps }} bp</div>
+    {% else %}<div class="neutral">Data unavailable</div>{% endif %}
+{% else %}
+    {% if item.change_pct is not none %}
+    <div class="{% if item.change_pct>0 %}positive{% elif item.change_pct<0 %}negative{% else %}neutral{% endif %}">{% if item.change_pct>0 %}+{% endif %}{{ item.change_pct }}%</div>
+    {% else %}<div class="neutral">Data unavailable</div>{% endif %}
+{% endif %}
 </div>
+{% endfor %}
+</div>
+
+<div class="section-title">Rates Monitor</div>
+<div class="components">
+<div class="component"><div class="component-name">Rates Score</div><div class="component-score">{{ data.rates.score }} <span style="font-size:14px;color:#697282">/100</span></div></div>
+<div class="component"><div class="component-name">US 2Y Move</div><div class="component-score">{{ data.rates.us2y_bps if data.rates.us2y_bps is not none else 'N/A' }} <span style="font-size:14px;color:#697282">bp</span></div></div>
+<div class="component"><div class="component-name">US 10Y Move</div><div class="component-score">{{ data.rates.us10y_bps if data.rates.us10y_bps is not none else 'N/A' }} <span style="font-size:14px;color:#697282">bp</span></div></div>
+<div class="component"><div class="component-name">US 30Y Move</div><div class="component-score">{{ data.rates.us30y_bps if data.rates.us30y_bps is not none else 'N/A' }} <span style="font-size:14px;color:#697282">bp</span></div></div>
+<div class="component"><div class="component-name">Weighted Yield Move</div><div class="component-score">{{ data.rates.weighted_bps }} <span style="font-size:14px;color:#697282">bp</span></div></div>
+</div>
+<div class="panel" style="margin-top:12px"><div class="news-title">Rates Regime</div><div class="note"><strong>{{ data.rates.regime }}</strong> • Weighting: 2Y 50% / 10Y 35% / 30Y 15%. Positive bps means yields are rising and is a headwind for gold.</div></div>
 
 <div class="section-title">Gold Score Components</div><div class="components">{% for name,value in data.components.items() %}<div class="component"><div class="component-name">{{ name }}</div><div class="component-score">{{ value }} <span style="font-size:14px;color:#697282">/100</span></div></div>{% endfor %}</div>
 
@@ -1382,7 +1520,7 @@ def dashboard():
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. Economic 2Y confirmation also uses basis points.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
 </div><script>setTimeout(function(){window.location.reload();},30000);</script></body></html>
 '''
     return render_template_string(html, data=data)
