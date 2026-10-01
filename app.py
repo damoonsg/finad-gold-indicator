@@ -31,8 +31,10 @@ FED_CACHE_SECONDS = 300
 FED_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-FED_MAX_DOCUMENTS = 12
-FED_DOC_CHAR_LIMIT = 3600
+FED_MAX_DOCUMENTS = 18
+FED_DOC_CHAR_LIMIT = 2600
+FED_AI_BATCH_SIZE = 6
+FED_MAX_DOCS_PER_SPEAKER = 3
 ECON_CACHE = {"time": 0, "result": None, "last_2y": None}
 ECON_CACHE_SECONDS = 300
 
@@ -838,7 +840,7 @@ def _fed_raw_document(text, source, date=None, title=None, link=None, official_s
     }
 
 
-def get_board_speech_documents(limit=8):
+def get_board_speech_documents(limit=30):
     items = []
     try:
         r = requests.get("https://www.federalreserve.gov/feeds/speeches.xml", headers=HEADERS, timeout=(3, 8))
@@ -865,7 +867,7 @@ def get_board_speech_documents(limit=8):
     return items
 
 
-def get_williams_speech_documents(limit=5):
+def get_williams_speech_documents(limit=12):
     items = []
     try:
         index_url = "https://www.newyorkfed.org/newsevents/speeches/index"
@@ -922,6 +924,32 @@ def dedupe_fed_documents(documents):
             unique.append(doc)
     unique.sort(key=lambda x: parse_date(x.get("date")) or datetime(2000, 1, 1, tzinfo=timezone.utc), reverse=True)
     return unique
+
+
+def balanced_fed_candidates(documents, max_per_speaker=FED_MAX_DOCS_PER_SPEAKER, total_limit=FED_MAX_DOCUMENTS):
+    """Keep several recent documents per speaker instead of only the newest global items.
+
+    This lets semantic analysis reject a non-policy speech and still inspect an
+    earlier policy-relevant statement from the same speaker within the recency window.
+    """
+    counts = {}
+    result = []
+    ordered = sorted(
+        documents,
+        key=lambda x: parse_date(x.get("date")) or datetime(2000, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
+    for doc in ordered:
+        speaker = doc.get("speaker")
+        if not speaker:
+            continue
+        if counts.get(speaker, 0) >= max_per_speaker:
+            continue
+        result.append(doc)
+        counts[speaker] = counts.get(speaker, 0) + 1
+        if len(result) >= total_limit:
+            break
+    return result
 
 
 def latest_fed_document_per_speaker(documents):
@@ -990,23 +1018,13 @@ def _fed_documents_fingerprint(documents):
 def _groq_semantic_fed_analysis(documents):
     """Read whole-message context with an LLM and return structured stance analysis.
 
-    Keyword matching is used only to identify speakers/documents, never to score
-    hawkishness or dovishness.
+    Documents are analyzed in small batches so we can inspect several documents
+    per speaker without sending an oversized prompt. Keyword matching is used only
+    to identify speakers/documents, never to score stance.
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not configured")
-
-    docs_for_model = []
-    for i, doc in enumerate(documents[:FED_MAX_DOCUMENTS], 1):
-        docs_for_model.append({
-            "id": i,
-            "speaker": doc.get("speaker"),
-            "date": doc.get("date"),
-            "source": doc.get("source"),
-            "title": doc.get("title"),
-            "text": (doc.get("text") or "")[:FED_DOC_CHAR_LIMIT],
-        })
 
     system_prompt = """You are a monetary-policy research analyst. Analyze Federal Reserve communications by meaning and policy intent, not keyword counts.
 
@@ -1041,30 +1059,48 @@ Return ONLY valid JSON with this shape:
 Views must be one of: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DOVISH, STRONGLY DOVISH, MIXED, NOT DISCUSSED.
 Confidence is 0-100. Keep summaries factual and concise."""
 
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps({"documents": docs_for_model}, ensure_ascii=False)},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 1800,
-        "response_format": {"type": "json_object"},
-    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 25))
-    r.raise_for_status()
-    data = r.json()
-    content = data["choices"][0]["message"]["content"]
-    parsed = _parse_json_object(content)
-    analyses = parsed.get("analyses")
-    if not isinstance(analyses, list):
-        raise ValueError("AI response missing analyses array")
-    return analyses
 
+    analyses = []
+    docs = documents[:FED_MAX_DOCUMENTS]
+    for batch_start in range(0, len(docs), FED_AI_BATCH_SIZE):
+        batch = docs[batch_start:batch_start + FED_AI_BATCH_SIZE]
+        docs_for_model = []
+        for local_idx, doc in enumerate(batch, 1):
+            global_id = batch_start + local_idx
+            docs_for_model.append({
+                "id": global_id,
+                "speaker": doc.get("speaker"),
+                "date": doc.get("date"),
+                "source": doc.get("source"),
+                "title": doc.get("title"),
+                "text": (doc.get("text") or "")[:FED_DOC_CHAR_LIMIT],
+            })
+
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps({"documents": docs_for_model}, ensure_ascii=False)},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1800,
+            "response_format": {"type": "json_object"},
+        }
+        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 25))
+        r.raise_for_status()
+        data = r.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = _parse_json_object(content)
+        batch_analyses = parsed.get("analyses")
+        if not isinstance(batch_analyses, list):
+            raise ValueError("AI response missing analyses array")
+        analyses.extend(batch_analyses)
+
+    return analyses
 
 def _build_semantic_fed_result(documents, analyses):
     by_id = {}
@@ -1152,6 +1188,7 @@ def _build_semantic_fed_result(documents, analyses):
         "score": round(score, 1),
         "events": events,
         "event_count": len(events),
+        "candidate_count": len(documents),
         "average_stance": round(avg_stance, 2),
         "mode": "AI SEMANTIC",
         "model": GROQ_MODEL,
@@ -1164,8 +1201,8 @@ def get_fed_monitor(telegram_news, utotimes_news):
         return FED_CACHE["result"]
 
     documents = []
-    documents.extend(get_board_speech_documents(8))
-    documents.extend(get_williams_speech_documents(5))
+    documents.extend(get_board_speech_documents(30))
+    documents.extend(get_williams_speech_documents(12))
 
     for item in telegram_news:
         doc = _fed_raw_document(
@@ -1188,9 +1225,11 @@ def get_fed_monitor(telegram_news, utotimes_news):
             documents.append(doc)
 
     documents = dedupe_fed_documents(documents)
-    # Keep several recent documents so the AI can reject non-policy speeches.
-    # Latest policy-relevant document per speaker is selected AFTER semantic analysis.
-    documents = documents[:FED_MAX_DOCUMENTS]
+    # Keep up to several recent documents PER SPEAKER. This prevents a cluster of
+    # non-policy speeches from crowding out an older, still-recent policy statement.
+    # The AI then rejects irrelevant documents and the latest relevant one per
+    # speaker is selected after semantic analysis.
+    documents = balanced_fed_candidates(documents)
 
     if not documents:
         result = {
@@ -2022,8 +2061,8 @@ def build_dashboard_data():
         "oil": yahoo_market("CL=F"),
         "vix": yahoo_market("^VIX"),
     }
-    telegram_news = get_utofx_news(12)
-    utotimes_news = get_utotimes_news(8)
+    telegram_news = get_utofx_news(40)
+    utotimes_news = get_utotimes_news(30)
     fed = get_fed_monitor(telegram_news, utotimes_news)
     # Only use 2Y as an event-time confirmation when the source is truly intraday.
     # Daily Treasury/FRED closes are useful for the Rates Engine, but using a stale
@@ -2201,7 +2240,7 @@ def dashboard():
 <div class="section-title">Fed Monitor — Semantic Reading of Latest Stance</div>
 <div class="panel" style="margin-bottom:12px">
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
-<span class="note"> • {{ data.fed.event_count }} latest speaker stances • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
+<span class="note"> • {{ data.fed.event_count }} latest policy stances{% if data.fed.candidate_count is defined %} from {{ data.fed.candidate_count }} recent candidate documents{% endif %} • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
 </div>
