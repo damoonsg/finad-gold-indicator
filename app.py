@@ -17,6 +17,8 @@ HEADERS = {
 
 CACHE = {"time": 0, "data": None}
 CACHE_SECONDS = 25
+XAU_CACHE = {"time": 0, "data": None}
+XAU_CACHE_SECONDS = 60
 FED_CACHE = {"time": 0, "result": None}
 FED_CACHE_SECONDS = 300
 ECON_CACHE = {"time": 0, "result": None, "last_2y": None}
@@ -249,6 +251,91 @@ def yahoo_market(symbol):
         }
     except Exception:
         return {"price": None, "previous": None, "change": None, "change_pct": None, "ok": False}
+
+
+def xau_spot_market():
+    """Fetch live XAU/USD spot from XAUS.com (free, no API key).
+
+    The live spot price comes from /api/v1/spot. Daily change is calculated
+    against the most recent completed daily close from /api/v1/history.
+    """
+    now = time.time()
+    if XAU_CACHE["data"] is not None and now - XAU_CACHE["time"] < XAU_CACHE_SECONDS:
+        return XAU_CACHE["data"]
+
+    try:
+        fresh = int(now // 60)
+        spot_url = f"https://xaus.com/api/v1/spot?compact=1&fresh={fresh}"
+        r = requests.get(spot_url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        spot = r.json()
+
+        price = spot.get("spot_usd_oz")
+        if price is None:
+            price = (spot.get("xau") or {}).get("price")
+
+        previous = None
+        try:
+            hr = requests.get("https://xaus.com/api/v1/history", headers=HEADERS, timeout=10)
+            hr.raise_for_status()
+            history = hr.json()
+            points = history.get("points") or []
+            valid = []
+            for point in points:
+                d = point.get("d")
+                c = point.get("c")
+                if d and c is not None:
+                    try:
+                        valid.append((str(d), float(c)))
+                    except Exception:
+                        pass
+            if valid:
+                valid.sort(key=lambda x: x[0])
+                today = datetime.now(timezone.utc).date().isoformat()
+                completed = [row for row in valid if row[0] < today]
+                if completed:
+                    previous = completed[-1][1]
+                elif len(valid) >= 2:
+                    previous = valid[-2][1]
+                else:
+                    previous = valid[-1][1]
+        except Exception:
+            previous = None
+
+        change = None
+        change_pct = None
+        if price is not None and previous:
+            change = float(price) - float(previous)
+            change_pct = (change / float(previous)) * 100
+
+        state = spot.get("data_state") or {}
+        result = {
+            "price": safe_round(price, 2),
+            "previous": safe_round(previous, 2),
+            "change": safe_round(change, 2),
+            "change_pct": safe_round(change_pct, 2),
+            "ok": price is not None,
+            "source": "XAUS.com",
+            "data_state": state.get("status", "unknown"),
+            "as_of": state.get("as_of") or spot.get("price_as_of") or spot.get("updated_at"),
+        }
+        XAU_CACHE["time"] = now
+        XAU_CACHE["data"] = result
+        return result
+    except Exception:
+        result = {
+            "price": None,
+            "previous": None,
+            "change": None,
+            "change_pct": None,
+            "ok": False,
+            "source": "XAUS.com",
+            "data_state": "unavailable",
+            "as_of": None,
+        }
+        XAU_CACHE["time"] = now
+        XAU_CACHE["data"] = result
+        return result
 
 # =========================================================
 # NEWS SOURCES
@@ -1230,7 +1317,7 @@ def build_dashboard_data():
     if CACHE["data"] is not None and now - CACHE["time"] < CACHE_SECONDS:
         return CACHE["data"]
     markets = {
-        "gold": yahoo_market("XAUUSD=X"), "dxy": yahoo_market("DX-Y.NYB"),
+        "gold": xau_spot_market(), "dxy": yahoo_market("DX-Y.NYB"),
         "us2y": yahoo_market("2YY=F"), "us10y": yahoo_market("^TNX"),
         "us30y": yahoo_market("^TYX"), "oil": yahoo_market("CL=F"), "vix": yahoo_market("^VIX"),
     }
