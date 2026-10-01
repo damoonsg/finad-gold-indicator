@@ -8,6 +8,8 @@ import requests
 import time
 import re
 import xml.etree.ElementTree as ET
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -25,6 +27,11 @@ FED_CACHE = {"time": 0, "result": None}
 FED_CACHE_SECONDS = 300
 ECON_CACHE = {"time": 0, "result": None, "last_2y": None}
 ECON_CACHE_SECONDS = 300
+
+# Non-blocking dashboard refresh state. The HTML page should never wait for
+# slow external data providers on a cold Render start.
+REFRESH_LOCK = threading.Lock()
+REFRESH_STATE = {"running": False, "last_error": None, "started": 0}
 
 FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 UTOTIMES_FEEDS = [
@@ -361,7 +368,7 @@ def _marketwatch_treasury_quote(tenor):
         "Referer": "https://www.marketwatch.com/",
     })
 
-    r = requests.get(url, headers=headers, timeout=10)
+    r = requests.get(url, headers=headers, timeout=(3.0, 5.0))
     r.raise_for_status()
 
     current, previous = _extract_marketwatch_yield(r.text)
@@ -385,7 +392,7 @@ def _marketwatch_treasury_quote(tenor):
 def _fred_series_latest(series_id):
     """Daily constant-maturity Treasury yield from FRED; no API key required."""
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    r = requests.get(url, headers=HEADERS, timeout=12)
+    r = requests.get(url, headers=HEADERS, timeout=(3.0, 6.0))
     r.raise_for_status()
 
     rows = []
@@ -436,12 +443,12 @@ def _fred_treasury_curve():
 
 
 def treasury_spot_curve():
-    """Return 2Y/10Y/30Y *spot yields* from one consistent source.
+    """Return 2Y/10Y/30Y spot Treasury yields from one consistent source.
 
-    Primary source is MarketWatch, which provides current Treasury yields and
-    previous closes for all three maturities. If any tenor cannot be fetched,
-    the entire curve falls back to daily FRED constant-maturity yields, so the
-    three maturities are never mixed across incompatible sources.
+    MarketWatch is attempted first. All three tenors are fetched concurrently
+    so one slow endpoint cannot make the page wait 30+ seconds. If any live
+    quote fails, all three tenors fall back together to FRED daily data, also
+    fetched concurrently.
     """
     now = time.time()
 
@@ -451,39 +458,54 @@ def treasury_spot_curve():
     ):
         return TREASURY_CACHE["data"]
 
+    tenors = ("2Y", "10Y", "30Y")
     curve = None
 
     try:
-        live_curve = {
-            "2Y": _marketwatch_treasury_quote("2Y"),
-            "10Y": _marketwatch_treasury_quote("10Y"),
-            "30Y": _marketwatch_treasury_quote("30Y"),
-        }
-        if all(live_curve[x].get("ok") for x in ("2Y", "10Y", "30Y")):
-            curve = live_curve
+        live_curve = {}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_marketwatch_treasury_quote, tenor): tenor for tenor in tenors}
+            for future in as_completed(futures):
+                tenor = futures[future]
+                live_curve[tenor] = future.result()
+        if all(live_curve.get(x, {}).get("ok") for x in tenors):
+            curve = {x: live_curve[x] for x in tenors}
     except Exception:
         curve = None
 
     if curve is None:
         try:
-            curve = _fred_treasury_curve()
+            series_map = {"2Y": "DGS2", "10Y": "DGS10", "30Y": "DGS30"}
+            fred_raw = {}
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {pool.submit(_fred_series_latest, sid): tenor for tenor, sid in series_map.items()}
+                for future in as_completed(futures):
+                    tenor = futures[future]
+                    fred_raw[tenor] = future.result()
+
+            curve = {}
+            for tenor in tenors:
+                current, previous, current_date, previous_date = fred_raw[tenor]
+                curve[tenor] = {
+                    "price": safe_round(current, 3),
+                    "previous": safe_round(previous, 3),
+                    "change": safe_round(current - previous, 3),
+                    "change_pct": safe_round(((current - previous) / previous) * 100, 2) if previous else None,
+                    "change_bps": safe_round((current - previous) * 100.0, 1),
+                    "ok": True,
+                    "source": "FRED Daily",
+                    "tenor": tenor,
+                    "as_of": current_date,
+                    "previous_as_of": previous_date,
+                }
         except Exception:
             curve = {
-                "2Y": {
+                tenor: {
                     "price": None, "previous": None, "change": None,
                     "change_pct": None, "change_bps": None, "ok": False,
-                    "source": "Unavailable", "tenor": "2Y",
-                },
-                "10Y": {
-                    "price": None, "previous": None, "change": None,
-                    "change_pct": None, "change_bps": None, "ok": False,
-                    "source": "Unavailable", "tenor": "10Y",
-                },
-                "30Y": {
-                    "price": None, "previous": None, "change": None,
-                    "change_pct": None, "change_bps": None, "ok": False,
-                    "source": "Unavailable", "tenor": "30Y",
-                },
+                    "source": "Unavailable", "tenor": tenor,
+                }
+                for tenor in tenors
             }
 
     TREASURY_CACHE["time"] = now
@@ -1669,13 +1691,102 @@ def build_dashboard_data():
     CACHE["data"] = data
     return data
 
+
+def _initial_dashboard_data():
+    market_blank = {
+        "price": None, "previous": None, "change": None,
+        "change_pct": None, "change_bps": None, "ok": False,
+        "source": "Loading",
+    }
+    markets = {
+        "gold": dict(market_blank),
+        "dxy": dict(market_blank),
+        "us2y": dict(market_blank),
+        "us10y": dict(market_blank),
+        "us30y": dict(market_blank),
+        "oil": dict(market_blank),
+        "vix": dict(market_blank),
+    }
+    components = {
+        "Economic Data": 50.0,
+        "Federal Reserve": 50.0,
+        "Rates": 50.0,
+        "US Dollar": 50.0,
+        "Geopolitical Risk": 50.0,
+        "Oil / Inflation": 50.0,
+        "Market Flow": 50.0,
+        "Technical": 50.0,
+    }
+    return {
+        "score": 50.0,
+        "bias": "LOADING",
+        "components": components,
+        "markets": markets,
+        "rates": {
+            "score": 50.0, "weighted_bps": 0.0,
+            "us2y_bps": None, "us10y_bps": None, "us30y_bps": None,
+            "regime": "INITIALIZING DATA",
+        },
+        "economic": {
+            "score": 50.0, "market_shock_score": 50.0,
+            "fed_policy_score": 50.0, "underlying_score": 50.0,
+            "categories": {"Inflation": 50.0, "Labor": 50.0, "Growth": 50.0, "Consumption": 50.0},
+            "events": [], "event_count": 0,
+        },
+        "fed": {"score": 50.0, "events": [], "event_count": 0},
+        "telegram_news": [], "utotimes_news": [],
+        "updated": "Waiting for first data refresh…",
+        "initializing": True,
+        "refreshing": True,
+    }
+
+
+def _background_refresh():
+    try:
+        # Mark the main cache stale so this thread performs a real refresh.
+        build_dashboard_data()
+        REFRESH_STATE["last_error"] = None
+    except Exception as exc:
+        REFRESH_STATE["last_error"] = str(exc)[:300]
+    finally:
+        with REFRESH_LOCK:
+            REFRESH_STATE["running"] = False
+
+
+def _ensure_background_refresh():
+    now = time.time()
+    stale = CACHE["data"] is None or (now - CACHE["time"] >= CACHE_SECONDS)
+    if not stale:
+        return False
+    with REFRESH_LOCK:
+        if REFRESH_STATE["running"]:
+            return True
+        REFRESH_STATE["running"] = True
+        REFRESH_STATE["started"] = now
+        thread = threading.Thread(target=_background_refresh, daemon=True)
+        thread.start()
+        return True
+
+
+def get_dashboard_snapshot():
+    refreshing = _ensure_background_refresh()
+    if CACHE["data"] is None:
+        data = _initial_dashboard_data()
+    else:
+        # Shallow copy is enough because template rendering is read-only.
+        data = dict(CACHE["data"])
+        data["initializing"] = False
+        data["refreshing"] = refreshing
+    data["refresh_error"] = REFRESH_STATE.get("last_error")
+    return data
+
 @app.route("/api/status")
 def api_status():
-    return jsonify(build_dashboard_data())
+    return jsonify(get_dashboard_snapshot())
 
 @app.route("/")
 def dashboard():
-    data = build_dashboard_data()
+    data = get_dashboard_snapshot()
     html = r'''
 <!DOCTYPE html>
 <html lang="en">
@@ -1739,8 +1850,8 @@ def dashboard():
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses spot Treasury yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. Primary source: MarketWatch; all three tenors fall back together to FRED daily if live parsing is unavailable. Economic 2Y confirmation also uses basis points.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
-</div><script>setTimeout(function(){window.location.reload();},30000);</script></body></html>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses spot Treasury yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. Primary source: MarketWatch; all three tenors fall back together to FRED daily if live parsing is unavailable. Economic 2Y confirmation also uses basis points.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+</div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
 
