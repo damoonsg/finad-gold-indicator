@@ -838,6 +838,342 @@ def get_economic_monitor(two_year_change_pct=None):
     return result
 
 # =========================================================
+# ECONOMIC ENGINE V2 — EXACT SECTION MATCHING + REVISIONS
+# =========================================================
+
+# Add two useful profiles that were not in the first version.
+if not any(p["name"] == "Headline PCE" for p in EVENT_PROFILES):
+    EVENT_PROFILES.insert(1, {
+        "name": "Headline PCE",
+        "aliases": ["pce price index", "شاخص هزینه های مصرف شخصی", "شاخص هزینه‌های مصرف شخصی"],
+        "category": "Inflation", "direction": -1, "scale": 0.10,
+        "immediate_weight": 3.0, "policy_weight": 4.3, "persistence_hours": 336,
+    })
+
+if not any(p["name"] == "ISM Services Prices" for p in EVENT_PROFILES):
+    EVENT_PROFILES.append({
+        "name": "ISM Services Prices",
+        "aliases": ["ism services prices", "ism services prices paid", "مولفه قیمت های خدمات ism", "مولفه قیمت‌های خدمات ism"],
+        "category": "Inflation", "direction": -1, "scale": 2.0,
+        "immediate_weight": 2.6, "policy_weight": 3.2, "persistence_hours": 168,
+    })
+
+FF_EXACT_TITLES = {
+    "Core PCE": ["core pce price index m/m", "core pce price index y/y", "core pce price index"],
+    "Headline PCE": ["pce price index m/m", "pce price index y/y", "pce price index"],
+    "Core CPI": ["core cpi m/m", "core cpi y/y", "core cpi"],
+    "Headline CPI": ["cpi m/m", "cpi y/y", "consumer price index"],
+    "Core PPI": ["core ppi m/m", "core ppi"],
+    "PPI": ["ppi m/m", "producer price index"],
+    "ISM Prices Paid": ["ism manufacturing prices", "ism manufacturing prices index"],
+    "ISM Services Prices": ["ism services prices", "ism services prices paid"],
+    "Nonfarm Payrolls": ["non-farm employment change", "nonfarm payrolls", "non-farm payrolls"],
+    "Unemployment Rate": ["unemployment rate"],
+    "Average Hourly Earnings": ["average hourly earnings m/m", "average hourly earnings"],
+    "Initial Jobless Claims": ["unemployment claims", "initial jobless claims"],
+    "Continuing Claims": ["continuing jobless claims", "continuing claims"],
+    "ADP Employment": ["adp non-farm employment change", "adp employment change"],
+    "JOLTS": ["jolts job openings"],
+    "ISM Manufacturing": ["ism manufacturing pmi"],
+    "ISM Services": ["ism services pmi", "ism non-manufacturing pmi"],
+    "GDP": ["advance gdp q/q", "prelim gdp q/q", "final gdp q/q", "gdp q/q"],
+    "Core Retail Sales": ["core retail sales m/m", "core retail sales"],
+    "Retail Sales": ["retail sales m/m", "retail sales"],
+    "Consumer Confidence": ["cb consumer confidence", "consumer confidence"],
+    "Consumer Sentiment": ["prelim uom consumer sentiment", "revised uom consumer sentiment", "uom consumer sentiment", "consumer sentiment"],
+}
+
+US_CONTEXT_TERMS = [
+    "united states", "u.s.", "america", "american", "ایالات متحده", "آمریکا", "امریکا", "دلار آمریکا", "usd"
+]
+US_INTRINSIC_EVENTS = {
+    "Core PCE", "Headline PCE", "Nonfarm Payrolls", "Initial Jobless Claims",
+    "Continuing Claims", "ADP Employment", "JOLTS", "ISM Manufacturing",
+    "ISM Prices Paid", "ISM Services", "ISM Services Prices",
+}
+
+
+def _profile_alias_markers(text):
+    """Find event headings and suppress overlapping generic aliases.
+
+    Example: 'Core Retail Sales' wins over the shorter 'Retail Sales' alias.
+    This also lets one UtoTimes article safely contain both ISM PMI and ISM Prices.
+    """
+    lower = normalize_text(text)
+    candidates = []
+    for profile in EVENT_PROFILES:
+        for alias in profile["aliases"]:
+            a = normalize_text(alias)
+            if not a:
+                continue
+            for m in re.finditer(re.escape(a), lower, flags=re.I):
+                candidates.append((m.start(), m.end(), profile, a))
+
+    kept = []
+    for cand in sorted(candidates, key=lambda x: (-(x[1] - x[0]), x[0])):
+        if any(not (cand[1] <= k[0] or cand[0] >= k[1]) for k in kept):
+            continue
+        kept.append(cand)
+    kept.sort(key=lambda x: x[0])
+    return lower, kept
+
+
+def extract_event_sections(text):
+    lower, markers = _profile_alias_markers(text)
+    sections = []
+    for i, marker in enumerate(markers):
+        start = marker[0]
+        end = markers[i + 1][0] if i + 1 < len(markers) else len(lower)
+        end = min(end, start + 1600)
+        sections.append((marker[2], lower[start:end].strip()))
+    return sections
+
+
+def _parse_unit_value(number_text, unit_text=""):
+    value = parse_number(number_text)
+    if value is None:
+        return None
+    unit = normalize_text(unit_text)
+    if unit in ("میلیون", "m"):
+        value *= 1000.0
+    elif unit in ("میلیارد", "b"):
+        value *= 1000000.0
+    return value
+
+
+def extract_previous_revision(block):
+    """Return (original_previous, revised_previous, delta) when revision is explicit."""
+    previous_label = extract_labeled_number(block, ["قبلی", "previous"])
+    if previous_label is None:
+        return None, None, None
+
+    clean = normalize_digits(block).replace("٫", ".").replace("٬", ",")
+    label = re.search(
+        r"(?:قبلی|previous)\s*[:：]?\s*[\.…·_\-–—\s]*[+-]?\d+(?:\.\d+)?(?:\-)?\s*(?:%|درصد|هزار|میلیون|میلیارد|K|M|B)?",
+        clean, flags=re.I,
+    )
+    snippet = clean[label.end():label.end() + 320] if label else clean[:320]
+    num = r"([+-]?\d+(?:\.\d+)?)(?:\-)?\s*(%|درصد|هزار|میلیون|میلیارد|K|M|B)?"
+
+    # Example: قبلی 198 ... (این داده از 196 هزار نفر تجدید شده است)
+    m = re.search(rf"(?:از|revised\s+from|from)\s*{num}[^\)\]\n]{{0,100}}(?:تجدید|بازبینی|revis)", snippet, flags=re.I)
+    if m:
+        original = _parse_unit_value(m.group(1), m.group(2) or "")
+        revised = previous_label
+        return original, revised, (revised - original) if original is not None else None
+
+    # Example: قبلی 214 ... (به 215 هزار نفر بازبینی شد)
+    m = re.search(rf"(?:به|revised\s+to|to)\s*{num}[^\)\]\n]{{0,100}}(?:تجدید|بازبینی|revis)", snippet, flags=re.I)
+    if m:
+        revised = _parse_unit_value(m.group(1), m.group(2) or "")
+        original = previous_label
+        return original, revised, (revised - original) if revised is not None else None
+
+    return None, previous_label, None
+
+
+def _is_us_article(text, profiles):
+    lower = normalize_text(text)
+    if any(term in lower for term in US_CONTEXT_TERMS):
+        return True
+    return bool({p["name"] for p in profiles} & US_INTRINSIC_EVENTS)
+
+
+def economic_article_candidate(title, content=""):
+    body = BeautifulSoup(content or "", "html.parser").get_text(" ", strip=True)
+    combined = f"{title} {body}"
+    profiles = find_all_profiles(combined)
+    return bool(profiles) and _is_us_article(combined, profiles)
+
+
+def get_economic_articles(limit=24):
+    items = []
+    seen = set()
+    for feed_url in UTOTIMES_FEEDS:
+        for item in parse_rss_items(feed_url, limit=max(limit, 30)):
+            link = item.get("link")
+            if not link or link in seen:
+                continue
+            body = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
+            combined = f"{item.get('title','')} {body}"
+            profiles = find_all_profiles(combined)
+            if not profiles:
+                continue
+
+            page_date = None
+            # Fetch full page if the RSS body is incomplete or does not prove U.S. context.
+            if "واقعی" not in body and "actual" not in normalize_text(body) or not _is_us_article(combined, profiles):
+                page_text, page_date = fetch_page(link)
+                if page_text:
+                    body = page_text
+                    combined = f"{item.get('title','')} {body}"
+                    profiles = find_all_profiles(combined)
+
+            if not profiles or not _is_us_article(combined, profiles):
+                continue
+
+            seen.add(link)
+            items.append({
+                "title": item.get("title", ""), "link": link,
+                "date": item.get("date") or page_date, "text": body,
+            })
+            if len(items) >= limit:
+                return items
+        if items:
+            break
+    return items
+
+
+def _ff_title_match(profile_name, event_title):
+    title = normalize_text(event_title)
+    allowed = [normalize_text(x) for x in FF_EXACT_TITLES.get(profile_name, [])]
+    return title in allowed
+
+
+def ff_impact_for_profile(profile, event_date, ff_events):
+    """Exact event-title matching only; never fuzzy-match one ISM subindex to another."""
+    target_dt = parse_date(event_date)
+    best = None
+    best_hours = 9999.0
+    for event in ff_events:
+        if str(event.get("country", "")).upper() != "USD":
+            continue
+        if not _ff_title_match(profile["name"], event.get("title", "")):
+            continue
+        dt = parse_date(event.get("date"))
+        if target_dt and dt:
+            diff = abs((dt - target_dt).total_seconds()) / 3600.0
+            if diff > 18:
+                continue
+        elif target_dt or dt:
+            continue
+        else:
+            diff = 0.0
+        if diff < best_hours:
+            best, best_hours = event, diff
+    return best
+
+
+def score_release_v2(profile, actual, forecast, previous, date, impact, source, link,
+                     two_year_change_pct, previous_original=None, previous_revised=None,
+                     revision_delta=None):
+    if actual is None:
+        return None
+
+    if forecast is not None:
+        comparison, basis, confidence = actual - forecast, "forecast", 1.0
+    elif previous is not None:
+        comparison, basis, confidence = actual - previous, "previous", 0.45
+    else:
+        return None
+
+    surprise = max(-3.0, min(3.0, comparison / profile["scale"]))
+    signal = surprise * profile["direction"]
+    imp = impact_weight(impact)
+    immediate_main = signal * profile["immediate_weight"] * imp * confidence * immediate_decay(date)
+    policy_main = signal * profile["policy_weight"] * imp * confidence * policy_decay(date, profile["persistence_hours"])
+
+    revision_immediate = 0.0
+    revision_policy = 0.0
+    if revision_delta is not None and profile["scale"]:
+        rev_surprise = max(-2.0, min(2.0, revision_delta / profile["scale"]))
+        rev_signal = rev_surprise * profile["direction"]
+        revision_immediate = max(-1.5, min(1.5, rev_signal * profile["immediate_weight"] * imp * 0.15 * immediate_decay(date)))
+        revision_policy = max(-2.0, min(2.0, rev_signal * profile["policy_weight"] * imp * 0.25 * policy_decay(date, profile["persistence_hours"])))
+
+    immediate = max(-10, min(10, immediate_main + revision_immediate))
+    raw_policy = policy_main + revision_policy
+    confirmation = session_yield_confirmation(raw_policy, two_year_change_pct, date)
+    policy = max(-10, min(10, raw_policy * confirmation["multiplier"]))
+
+    return {
+        "name": profile["name"], "category": profile["category"],
+        "actual": value_display(actual), "forecast": value_display(forecast), "previous": value_display(previous),
+        "actual_num": actual, "forecast_num": forecast, "previous_num": previous,
+        "previous_original": value_display(previous_original) if previous_original is not None else "-",
+        "previous_revised": value_display(previous_revised) if previous_revised is not None else value_display(previous),
+        "revision_delta": revision_delta, "revision_impact": round(revision_policy, 2),
+        "impact": impact or "Unknown", "date": date, "basis": basis,
+        "surprise": round(surprise, 2),
+        "immediate_impact": round(immediate, 2), "policy_impact": round(policy, 2),
+        "confirmation": confirmation["status"], "source": source, "link": link,
+        "persistence_hours": profile["persistence_hours"],
+    }
+
+
+def extract_releases_from_article(article, ff_events, two_year_change_pct):
+    results = []
+    used = set()
+    combined = f"{article.get('title','')} {article.get('text','')}"
+
+    for profile, block in extract_event_sections(combined):
+        if profile["name"] in used:
+            continue
+        actual = extract_labeled_number(block, ["واقعی", "actual"])
+        if actual is None:
+            continue
+
+        forecast = extract_labeled_number(block, ["پیش‌بینی", "پیش بینی", "forecast"])
+        previous_original, previous_revised, revision_delta = extract_previous_revision(block)
+        previous = previous_revised
+
+        ff_match = ff_impact_for_profile(profile, article.get("date"), ff_events)
+        if ff_match:
+            # UtoTimes is primary. FF only fills a missing field after an exact title match.
+            if forecast is None:
+                forecast = parse_number(ff_match.get("forecast"))
+            if previous is None:
+                previous = parse_number(ff_match.get("previous"))
+                previous_revised = previous
+            impact = ff_match.get("impact")
+        else:
+            impact = "Medium"
+
+        scored = score_release_v2(
+            profile, actual, forecast, previous, article.get("date"), impact,
+            "UtoTimes", article.get("link"), two_year_change_pct,
+            previous_original=previous_original, previous_revised=previous_revised,
+            revision_delta=revision_delta,
+        )
+        if scored:
+            results.append(scored)
+            used.add(profile["name"])
+    return results
+
+
+def get_economic_monitor(two_year_change_pct=None):
+    now = time.time()
+    if ECON_CACHE["result"] is not None and now - ECON_CACHE["time"] < ECON_CACHE_SECONDS:
+        return ECON_CACHE["result"]
+
+    ff_events = fetch_ff_calendar()
+    articles = get_economic_articles(24)
+    scored = []
+    for article in articles:
+        scored.extend(extract_releases_from_article(article, ff_events, two_year_change_pct))
+    scored = dedupe_releases(scored)
+
+    active_policy = [e for e in scored if abs(e["policy_impact"]) > 0.01]
+    active_immediate = [e for e in scored if abs(e["immediate_impact"]) > 0.01]
+    market_shock = round(clamp(50 + sum(e["immediate_impact"] for e in active_immediate[:12])), 1)
+    fed_policy = round(clamp(50 + sum(e["policy_impact"] for e in active_policy[:20])), 1)
+    categories = build_category_scores(active_policy)
+    underlying = round(categories["Labor"] * 0.40 + categories["Growth"] * 0.35 + categories["Consumption"] * 0.25, 1)
+    economic_score = round(market_shock * 0.25 + fed_policy * 0.50 + underlying * 0.25, 1)
+
+    result = {
+        "score": economic_score, "market_shock_score": market_shock,
+        "fed_policy_score": fed_policy, "underlying_score": underlying,
+        "categories": categories, "events": scored[:15], "event_count": len(scored),
+        "source": "UtoTimes exact-section parser + Forex Factory exact-title backup",
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+    ECON_CACHE["time"] = now
+    ECON_CACHE["result"] = result
+    ECON_CACHE["last_2y"] = two_year_change_pct
+    return result
+
+# =========================================================
 # GOLD SCORE ENGINE
 # =========================================================
 
@@ -950,7 +1286,7 @@ def dashboard():
 {% for category,value in data.economic.categories.items() %}<div class="component"><div class="component-name">{{ category }}</div><div class="component-score">{{ value }} <span style="font-size:14px;color:#697282">/100</span></div></div>{% endfor %}
 </div>
 <div class="panel" style="margin-top:12px"><div class="news-title">Latest U.S. Economic Releases</div>
-{% if data.economic.events %}{% for event in data.economic.events[:10] %}<div class="news-item"><div style="font-weight:bold">{{ event.name }}</div><div class="note">Actual: <strong>{{ event.actual }}</strong> &nbsp;|&nbsp; Forecast: <strong>{{ event.forecast }}</strong> &nbsp;|&nbsp; Previous: <strong>{{ event.previous }}</strong></div><div class="note">Immediate Gold Impact: <strong class="{% if event.immediate_impact>0 %}positive{% elif event.immediate_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.immediate_impact>0 %}+{% endif %}{{ event.immediate_impact }}</strong> &nbsp;|&nbsp; Fed Policy Impact: <strong class="{% if event.policy_impact>0 %}positive{% elif event.policy_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.policy_impact>0 %}+{% endif %}{{ event.policy_impact }}</strong></div><div class="note">2Y Confirmation: <strong>{{ event.confirmation }}</strong> &nbsp;|&nbsp; Category: {{ event.category }} &nbsp;|&nbsp; Source: {{ event.source }}</div></div>{% endfor %}{% else %}<div class="note">No parsed U.S. releases yet.</div>{% endif %}
+{% if data.economic.events %}{% for event in data.economic.events[:10] %}<div class="news-item"><div style="font-weight:bold">{{ event.name }}</div><div class="note">Actual: <strong>{{ event.actual }}</strong> &nbsp;|&nbsp; Forecast: <strong>{{ event.forecast }}</strong> &nbsp;|&nbsp; Previous: <strong>{{ event.previous }}</strong></div>{% if event.previous_original != '-' or event.revision_delta is not none %}<div class="note">Previous originally reported: <strong>{{ event.previous_original }}</strong> &nbsp;|&nbsp; Previous revised: <strong>{{ event.previous_revised }}</strong> &nbsp;|&nbsp; Revision Gold Impact: <strong class="{% if event.revision_impact>0 %}positive{% elif event.revision_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.revision_impact>0 %}+{% endif %}{{ event.revision_impact }}</strong></div>{% endif %}<div class="note">Immediate Gold Impact: <strong class="{% if event.immediate_impact>0 %}positive{% elif event.immediate_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.immediate_impact>0 %}+{% endif %}{{ event.immediate_impact }}</strong> &nbsp;|&nbsp; Fed Policy Impact: <strong class="{% if event.policy_impact>0 %}positive{% elif event.policy_impact<0 %}negative{% else %}neutral{% endif %}">{% if event.policy_impact>0 %}+{% endif %}{{ event.policy_impact }}</strong></div><div class="note">2Y Confirmation: <strong>{{ event.confirmation }}</strong> &nbsp;|&nbsp; Category: {{ event.category }} &nbsp;|&nbsp; Source: {{ event.source }}</div></div>{% endfor %}{% else %}<div class="note">No parsed U.S. releases yet.</div>{% endif %}
 </div>
 
 <div class="section-title">Fed Monitor — Latest Stance Per Speaker</div><div class="panel" style="margin-bottom:12px">Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong> <span class="note">• {{ data.fed.event_count }} current non-neutral speaker stances</span></div><div class="fed-grid">
@@ -959,7 +1295,7 @@ def dashboard():
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are parsed from UtoTimes; Forex Factory is used for schedule/impact/backup forecast data.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">ONLINE</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
 </div><script>setTimeout(function(){window.location.reload();},30000);</script></body></html>
 '''
     return render_template_string(html, data=data)
