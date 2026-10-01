@@ -1230,7 +1230,7 @@ def build_dashboard_data():
     if CACHE["data"] is not None and now - CACHE["time"] < CACHE_SECONDS:
         return CACHE["data"]
     markets = {
-        "gold": yahoo_market("GC=F"), "dxy": yahoo_market("DX-Y.NYB"),
+        "gold": yahoo_market("XAUUSD=X"), "dxy": yahoo_market("DX-Y.NYB"),
         "us2y": yahoo_market("2YY=F"), "us10y": yahoo_market("^TNX"),
         "us30y": yahoo_market("^TYX"), "oil": yahoo_market("CL=F"), "vix": yahoo_market("^VIX"),
     }
@@ -1272,7 +1272,7 @@ def dashboard():
 <div class="hero"><div class="score-title">GOLD INTELLIGENCE SCORE</div><div class="score">{{ data.score }} <span>/100</span></div><div class="bias">{{ data.bias }}</div><div class="bar"><div class="bar-fill"></div></div><div class="scale"><span>BEARISH</span><span>NEUTRAL</span><span>BULLISH</span></div></div>
 
 <div class="section-title">Live Markets</div><div class="market-grid">
-{% set names={'gold':'Gold Futures','dxy':'DXY','us2y':'US 2Y','us10y':'US 10Y','us30y':'US 30Y','oil':'WTI Oil','vix':'VIX'} %}
+{% set names={'gold':'XAUUSD Spot','dxy':'DXY','us2y':'US 2Y','us10y':'US 10Y','us30y':'US 30Y','oil':'WTI Oil','vix':'VIX'} %}
 {% for key,item in data.markets.items() %}<div class="market-card"><div class="market-title">{{ names[key] }}</div><div class="market-price">{{ item.price if item.price is not none else 'N/A' }}</div>{% if item.change_pct is not none %}<div class="{% if item.change_pct>0 %}positive{% elif item.change_pct<0 %}negative{% else %}neutral{% endif %}">{% if item.change_pct>0 %}+{% endif %}{{ item.change_pct }}%</div>{% else %}<div class="neutral">Data unavailable</div>{% endif %}</div>{% endfor %}
 </div>
 
