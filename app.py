@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, render_template_string
 from datetime import datetime, timezone
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
 from difflib import SequenceMatcher
@@ -38,10 +38,10 @@ FED_MAX_DOCS_PER_SPEAKER = 2
 GEO_CACHE = {"time": 0, "result": None}
 GEO_CACHE_SECONDS = 300
 GEO_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
-GEO_MAX_CANDIDATES = 20
+GEO_MAX_CANDIDATES = 15
 GEO_MAX_EVENTS = 8
 TRUMP_TRUTH_ACCOUNT_ID = "107780257626128497"
-GEO_GROQ_MODEL = os.environ.get("GEO_GROQ_MODEL", "openai/gpt-oss-20b")
+GEO_GROQ_MODEL = os.environ.get("GEO_GROQ_MODEL", GROQ_MODEL)
 
 # Hybrid Fed stance sources: official Federal Reserve System sites are primary;
 # UtoTimes/UtoFX are secondary for timely same-day quotes/Q&A when official text
@@ -2443,6 +2443,22 @@ GDELT_GEO_QUERY = (
     'OR Taiwan OR Ukraine OR Iran OR Israel OR NATO OR "North Korea")'
 )
 
+# Smaller independent searches are more reliable than one oversized boolean query.
+GDELT_GEO_QUERIES = [
+    '(war OR missile OR airstrike OR ceasefire OR sanctions OR nuclear)',
+    '(Ukraine OR Russia OR NATO OR Taiwan OR "South China Sea" OR "North Korea")',
+    '(Iran OR Israel OR Gaza OR "Red Sea" OR "Strait of Hormuz")',
+    '(tariff OR "trade war" OR "export controls" OR blockade OR coup)',
+]
+
+GOOGLE_NEWS_GEO_QUERIES = [
+    'war missile airstrike ceasefire sanctions nuclear',
+    'Russia Ukraine NATO security',
+    'Iran Israel Gaza Red Sea Strait of Hormuz',
+    'China Taiwan South China Sea North Korea',
+    'tariff trade war export controls sanctions',
+]
+
 
 def _geo_parse_date(value):
     dt = parse_date(value)
@@ -2498,19 +2514,18 @@ def _looks_geopolitical(text):
     return any(term in t for term in GEO_RETRIEVAL_TERMS)
 
 
-def get_gdelt_geopolitical_news(limit=45):
-    """Global news radar. GDELT supplies broad worldwide coverage; AI decides relevance."""
+def _gdelt_geo_query(query, limit=18):
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
     params = {
-        "query": GDELT_GEO_QUERY,
+        "query": query,
         "mode": "artlist",
         "format": "json",
         "timespan": "24h",
-        "maxrecords": str(max(10, min(limit, 75))),
+        "maxrecords": str(max(10, min(limit, 35))),
         "sort": "datedesc",
     }
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=(4, 12))
+        r = requests.get(url, params=params, headers=HEADERS, timeout=(4, 10))
         r.raise_for_status()
         data = r.json()
     except Exception:
@@ -2534,14 +2549,84 @@ def get_gdelt_geopolitical_news(limit=45):
             "domain": domain,
             "credibility": _domain_credibility(domain),
         })
-    return items[:limit]
+    return items
+
+
+def get_gdelt_geopolitical_news(limit=45):
+    """Global GDELT radar using several smaller searches for reliability."""
+    gathered = []
+    with ThreadPoolExecutor(max_workers=len(GDELT_GEO_QUERIES)) as pool:
+        futures = [pool.submit(_gdelt_geo_query, q, 18) for q in GDELT_GEO_QUERIES]
+        for f in as_completed(futures):
+            try:
+                gathered.extend(f.result() or [])
+            except Exception:
+                pass
+    return _dedupe_geo_candidates(gathered)[:limit]
+
+
+def _google_news_geo_query(query, limit=14):
+    """Public Google News RSS fallback; no API key required."""
+    url = "https://news.google.com/rss/search"
+    params = {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=(4, 10))
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception:
+        return []
+
+    items = []
+    for node in root.findall(".//item"):
+        title = (node.findtext("title") or "").strip()
+        link = (node.findtext("link") or "").strip()
+        pub = (node.findtext("pubDate") or "").strip()
+        source_node = node.find("source")
+        source_name = (source_node.text or "").strip() if source_node is not None else "Google News source"
+        source_url = (source_node.attrib.get("url") or "").strip() if source_node is not None else ""
+        domain = (urlparse(source_url).hostname or "").lower().replace("www.", "") if source_url else ""
+        if not title or not link:
+            continue
+        # RSS search can be broad; retain candidates here and let semantic AI decide materiality.
+        items.append({
+            "text": title[:700],
+            "title": title[:300],
+            "date": _geo_iso(pub),
+            "link": link,
+            "source": source_name or domain or "Google News source",
+            "source_type": "GLOBAL NEWS",
+            "domain": domain,
+            "credibility": _domain_credibility(domain) if domain else 0.76,
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
+def get_google_news_geopolitical_news(limit=45):
+    gathered = []
+    with ThreadPoolExecutor(max_workers=len(GOOGLE_NEWS_GEO_QUERIES)) as pool:
+        futures = [pool.submit(_google_news_geo_query, q, 14) for q in GOOGLE_NEWS_GEO_QUERIES]
+        for f in as_completed(futures):
+            try:
+                gathered.extend(f.result() or [])
+            except Exception:
+                pass
+    return _dedupe_geo_candidates(gathered)[:limit]
 
 
 def get_trump_truth_posts(limit=10):
     """Best-effort direct public Trump Truth Social feed (Mastodon-compatible endpoint)."""
     url = f"https://truthsocial.com/api/v1/accounts/{TRUMP_TRUTH_ACCOUNT_ID}/statuses"
     try:
-        r = requests.get(url, params={"limit": min(limit, 20)}, headers=HEADERS, timeout=(4, 10))
+        truth_headers = dict(HEADERS)
+        truth_headers["Accept"] = "application/json"
+        r = requests.get(
+            url,
+            params={"limit": min(limit, 20), "exclude_replies": "true", "with_muted": "true"},
+            headers=truth_headers,
+            timeout=(4, 10),
+        )
         r.raise_for_status()
         statuses = r.json()
     except Exception:
@@ -2704,7 +2789,7 @@ def _groq_geopolitical_analysis(candidates):
         docs.append({
             "id": i, "date": c.get("date"), "source": c.get("source"),
             "source_type": c.get("source_type"), "credibility": round(float(c.get("credibility",0.68)),2),
-            "headline_or_text": (c.get("text") or "")[:1200],
+            "headline_or_text": (c.get("text") or "")[:850],
         })
 
     system_prompt = """You are a global geopolitical-risk analyst for a GOLD macro dashboard.
@@ -2737,8 +2822,7 @@ For each distinct event return:
 Return ONLY valid JSON: {"events":[...]}.
 Return at most 8 events, prioritizing gold relevance and recency. Do not invent facts beyond the supplied items."""
 
-    payload={
-        "model": GEO_GROQ_MODEL,
+    base_payload={
         "messages":[
             {"role":"system","content":system_prompt},
             {"role":"user","content":json.dumps({"items":docs},ensure_ascii=False)},
@@ -2748,15 +2832,32 @@ Return at most 8 events, prioritizing gold relevance and recency. Do not invent 
         "response_format":{"type":"json_object"},
     }
     headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"}
-    r=requests.post(GROQ_API_URL,headers=headers,json=payload,timeout=(5,25))
-    if r.status_code == 429:
-        raise RuntimeError("GROQ RATE LIMIT")
-    r.raise_for_status()
-    parsed=_parse_json_object(r.json()["choices"][0]["message"]["content"])
-    events=parsed.get("events")
-    if not isinstance(events,list):
-        raise ValueError("Geo AI response missing events array")
-    return events[:GEO_MAX_EVENTS]
+
+    # Use the same proven model as the Fed engine by default. If a custom Geo
+    # model is configured and Groq rejects it with a 4xx, retry once with the
+    # working Fed model instead of neutralizing the whole geopolitical engine.
+    models=[GEO_GROQ_MODEL]
+    if GROQ_MODEL not in models:
+        models.append(GROQ_MODEL)
+    errors=[]
+    for model in models:
+        payload=dict(base_payload)
+        payload["model"]=model
+        try:
+            r=requests.post(GROQ_API_URL,headers=headers,json=payload,timeout=(5,25))
+            if r.status_code == 429:
+                raise RuntimeError(f"GROQ RATE LIMIT on {model}")
+            if r.status_code >= 400:
+                detail=(r.text or "").replace("\n"," ")[:420]
+                raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
+            parsed=_parse_json_object(r.json()["choices"][0]["message"]["content"])
+            events=parsed.get("events")
+            if not isinstance(events,list):
+                raise ValueError("Geo AI response missing events array")
+            return events[:GEO_MAX_EVENTS]
+        except Exception as exc:
+            errors.append(str(exc))
+    raise RuntimeError(" | ".join(errors)[-900:])
 
 
 def _score_geopolitical_events(candidates, ai_events):
@@ -2846,23 +2947,26 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
         return GEO_CACHE["result"]
 
     # Fetch independent global sources concurrently so one slow provider cannot block the others.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         fg=pool.submit(get_gdelt_geopolitical_news,45)
+        fgn=pool.submit(get_google_news_geopolitical_news,45)
         ft=pool.submit(get_trump_truth_posts,10)
         fx=pool.submit(get_trump_x_posts,8)
         try: gdelt=fg.result()
         except Exception: gdelt=[]
+        try: google_news=fgn.result()
+        except Exception: google_news=[]
         try: truth=ft.result()
         except Exception: truth=[]
         try: xposts=fx.result()
         except Exception: xposts=[]
 
     uto=_uto_geo_candidates(telegram_news,utotimes_news)
-    all_items=_dedupe_geo_candidates(gdelt+truth+xposts+uto)
+    all_items=_dedupe_geo_candidates(gdelt+google_news+truth+xposts+uto)
     candidates=_select_geo_candidates(all_items,GEO_MAX_CANDIDATES)
 
     source_stats={
-        "gdelt":len(gdelt), "truth":len(truth), "x":len(xposts), "uto":len(uto),
+        "gdelt":len(gdelt), "google_news":len(google_news), "truth":len(truth), "x":len(xposts), "uto":len(uto),
         "candidates":len(candidates),
     }
 
@@ -3228,7 +3332,7 @@ def dashboard():
 </div>
 <div class="panel" style="margin-top:12px;margin-bottom:12px">
 <div class="news-title">{{ data.geopolitical.regime }}</div>
-<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT global news: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates analyzed: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong></div>
+<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates analyzed: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong></div>
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
 </div>
 <div class="fed-grid">
@@ -3279,7 +3383,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Score is global: GDELT worldwide news + Trump Truth/X direct statements + Uto secondary reporting. AI clusters duplicate coverage into one event, separates statements/threats from confirmed actions, and applies recency decay.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Score is global: GDELT + Google News worldwide radar + Trump Truth/X direct statements + Uto secondary reporting. AI clusters duplicate coverage into one event, separates statements/threats from confirmed actions, and applies recency decay.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
