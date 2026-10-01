@@ -22,7 +22,7 @@ CACHE_SECONDS = 25
 XAU_CACHE = {"time": 0, "data": None}
 XAU_CACHE_SECONDS = 60
 TREASURY_CACHE = {"time": 0, "data": None}
-TREASURY_CACHE_SECONDS = 60
+TREASURY_CACHE_SECONDS = 900
 FED_CACHE = {"time": 0, "result": None}
 FED_CACHE_SECONDS = 300
 ECON_CACHE = {"time": 0, "result": None, "last_2y": None}
@@ -442,76 +442,156 @@ def _fred_treasury_curve():
     return curve
 
 
-def treasury_spot_curve():
-    """Return 2Y/10Y/30Y spot Treasury yields from one consistent source.
+def _treasury_official_curve():
+    """Latest official U.S. Treasury nominal CMT curve from Treasury.gov.
 
-    MarketWatch is attempted first. All three tenors are fetched concurrently
-    so one slow endpoint cannot make the page wait 30+ seconds. If any live
-    quote fails, all three tenors fall back together to FRED daily data, also
-    fetched concurrently.
+    This source is free, requires no API key, and provides 2Y/10Y/30Y from
+    one internally consistent curve. Values are daily official closes, not
+    intraday quotes.
+    """
+    year = datetime.now(timezone.utc).year
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+        f"TextView?type=daily_treasury_yield_curve&field_tdr_date_value={year}"
+    )
+    headers = dict(HEADERS)
+    headers.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    r = requests.get(url, headers=headers, timeout=(3.0, 8.0))
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    rows = []
+    for table in soup.find_all("table"):
+        header_cells = table.find_all("th")
+        headers_text = [re.sub(r"\\s+", " ", h.get_text(" ", strip=True)).strip() for h in header_cells]
+        normalized = [h.lower().replace("yr", "yr").strip() for h in headers_text]
+
+        def find_col(candidates):
+            for i, h in enumerate(normalized):
+                compact = re.sub(r"\\s+", " ", h)
+                if compact in candidates:
+                    return i
+            return None
+
+        date_i = find_col({"date"})
+        y2_i = find_col({"2 yr", "2 year", "2-year"})
+        y10_i = find_col({"10 yr", "10 year", "10-year"})
+        y30_i = find_col({"30 yr", "30 year", "30-year"})
+        if None in (date_i, y2_i, y10_i, y30_i):
+            continue
+
+        for tr in table.find_all("tr"):
+            cells = tr.find_all("td")
+            if not cells:
+                continue
+            values = [re.sub(r"\\s+", " ", c.get_text(" ", strip=True)).strip() for c in cells]
+            if max(date_i, y2_i, y10_i, y30_i) >= len(values):
+                continue
+            try:
+                dt = datetime.strptime(values[date_i], "%m/%d/%Y").replace(tzinfo=timezone.utc)
+                y2 = float(values[y2_i])
+                y10 = float(values[y10_i])
+                y30 = float(values[y30_i])
+            except Exception:
+                continue
+            rows.append((dt, y2, y10, y30))
+
+    # Some Treasury page variants expose a duplicated/complex header. Fallback:
+    # identify rows by date and use the standard nominal CMT column ordering.
+    if len(rows) < 2:
+        for tr in soup.find_all("tr"):
+            cells = [re.sub(r"\\s+", " ", c.get_text(" ", strip=True)).strip() for c in tr.find_all("td")]
+            if len(cells) < 14:
+                continue
+            try:
+                dt = datetime.strptime(cells[0], "%m/%d/%Y").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            # Treasury nominal table commonly ends with: 1Y, 2Y, 3Y, 5Y, 7Y, 10Y, 20Y, 30Y.
+            numeric = []
+            for value in cells[1:]:
+                try:
+                    numeric.append(float(value))
+                except Exception:
+                    numeric.append(None)
+            valid_tail = [v for v in numeric if v is not None]
+            if len(valid_tail) >= 8:
+                try:
+                    y2, y10, y30 = valid_tail[-7], valid_tail[-3], valid_tail[-1]
+                    rows.append((dt, y2, y10, y30))
+                except Exception:
+                    pass
+
+    if len(rows) < 2:
+        raise ValueError("Could not parse official Treasury yield curve")
+
+    # Remove duplicate dates and sort chronologically.
+    by_date = {}
+    for row in rows:
+        by_date[row[0].date().isoformat()] = row
+    ordered = sorted(by_date.values(), key=lambda x: x[0])
+    current = ordered[-1]
+    previous = ordered[-2]
+
+    labels = {"2Y": 1, "10Y": 2, "30Y": 3}
+    curve = {}
+    for tenor, idx in labels.items():
+        cur = float(current[idx])
+        prev = float(previous[idx])
+        curve[tenor] = {
+            "price": safe_round(cur, 3),
+            "previous": safe_round(prev, 3),
+            "change": safe_round(cur - prev, 3),
+            "change_pct": safe_round(((cur - prev) / prev) * 100, 2) if prev else None,
+            "change_bps": safe_round((cur - prev) * 100.0, 1),
+            "ok": True,
+            "source": "U.S. Treasury Daily CMT",
+            "tenor": tenor,
+            "as_of": current[0].date().isoformat(),
+            "previous_as_of": previous[0].date().isoformat(),
+            "intraday": False,
+        }
+    return curve
+
+
+def treasury_spot_curve():
+    """Return 2Y/10Y/30Y Treasury yields from one consistent source.
+
+    Primary: official U.S. Treasury Daily CMT curve.
+    Fallback: FRED Daily. Both are daily closes and therefore are not used as
+    an intraday 2Y confirmation signal for a just-released economic report.
     """
     now = time.time()
-
     if (
         TREASURY_CACHE["data"] is not None
         and now - TREASURY_CACHE["time"] < TREASURY_CACHE_SECONDS
     ):
         return TREASURY_CACHE["data"]
 
-    tenors = ("2Y", "10Y", "30Y")
-    curve = None
-
     try:
-        live_curve = {}
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(_marketwatch_treasury_quote, tenor): tenor for tenor in tenors}
-            for future in as_completed(futures):
-                tenor = futures[future]
-                live_curve[tenor] = future.result()
-        if all(live_curve.get(x, {}).get("ok") for x in tenors):
-            curve = {x: live_curve[x] for x in tenors}
+        curve = _treasury_official_curve()
     except Exception:
-        curve = None
-
-    if curve is None:
         try:
-            series_map = {"2Y": "DGS2", "10Y": "DGS10", "30Y": "DGS30"}
-            fred_raw = {}
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = {pool.submit(_fred_series_latest, sid): tenor for tenor, sid in series_map.items()}
-                for future in as_completed(futures):
-                    tenor = futures[future]
-                    fred_raw[tenor] = future.result()
-
-            curve = {}
-            for tenor in tenors:
-                current, previous, current_date, previous_date = fred_raw[tenor]
-                curve[tenor] = {
-                    "price": safe_round(current, 3),
-                    "previous": safe_round(previous, 3),
-                    "change": safe_round(current - previous, 3),
-                    "change_pct": safe_round(((current - previous) / previous) * 100, 2) if previous else None,
-                    "change_bps": safe_round((current - previous) * 100.0, 1),
-                    "ok": True,
-                    "source": "FRED Daily",
-                    "tenor": tenor,
-                    "as_of": current_date,
-                    "previous_as_of": previous_date,
-                }
+            curve = _fred_treasury_curve()
+            for item in curve.values():
+                item["intraday"] = False
         except Exception:
             curve = {
                 tenor: {
                     "price": None, "previous": None, "change": None,
                     "change_pct": None, "change_bps": None, "ok": False,
                     "source": "Unavailable", "tenor": tenor,
+                    "as_of": None, "previous_as_of": None, "intraday": False,
                 }
-                for tenor in tenors
+                for tenor in ("2Y", "10Y", "30Y")
             }
 
     TREASURY_CACHE["time"] = now
     TREASURY_CACHE["data"] = curve
     return curve
-
 
 def xau_spot_market():
 
@@ -1679,7 +1759,15 @@ def build_dashboard_data():
     telegram_news = get_utofx_news(12)
     utotimes_news = get_utotimes_news(8)
     fed = get_fed_monitor(telegram_news, utotimes_news)
-    economic = get_economic_monitor(markets["us2y"].get("change_bps"))
+    # Only use 2Y as an event-time confirmation when the source is truly intraday.
+    # Daily Treasury/FRED closes are useful for the Rates Engine, but using a stale
+    # daily move to confirm a release from the last few hours would be misleading.
+    two_year_confirmation_bps = (
+        markets["us2y"].get("change_bps")
+        if markets["us2y"].get("intraday")
+        else None
+    )
+    economic = get_economic_monitor(two_year_confirmation_bps)
     score, bias, components, rates_engine = calculate_scores(markets, fed["score"], economic["score"])
     data = {
         "score": score, "bias": bias, "components": components, "markets": markets,
@@ -1829,7 +1917,7 @@ def dashboard():
 <div class="component"><div class="component-name">US 30Y Move</div><div class="component-score">{{ data.rates.us30y_bps if data.rates.us30y_bps is not none else 'N/A' }} <span style="font-size:14px;color:#697282">bp</span></div></div>
 <div class="component"><div class="component-name">Weighted Yield Move</div><div class="component-score">{{ data.rates.weighted_bps }} <span style="font-size:14px;color:#697282">bp</span></div></div>
 </div>
-<div class="panel" style="margin-top:12px"><div class="news-title">Rates Regime</div><div class="note"><strong>{{ data.rates.regime }}</strong> • Weighting: 2Y 50% / 10Y 35% / 30Y 15%. Positive bps means yields are rising and is a headwind for gold.</div><div class="note">Treasury source: <strong>{{ data.markets.us2y.source or "Unknown" }}</strong></div></div>
+<div class="panel" style="margin-top:12px"><div class="news-title">Rates Regime</div><div class="note"><strong>{{ data.rates.regime }}</strong> • Weighting: 2Y 50% / 10Y 35% / 30Y 15%. Positive bps means yields are rising and is a headwind for gold.</div><div class="note">Treasury source: <strong>{{ data.markets.us2y.source or "Unknown" }}</strong>{% if data.markets.us2y.as_of %} • Latest official close: <strong>{{ data.markets.us2y.as_of }}</strong>{% endif %}</div></div>
 
 <div class="section-title">Gold Score Components</div><div class="components">{% for name,value in data.components.items() %}<div class="component"><div class="component-name">{{ name }}</div><div class="component-score">{{ value }} <span style="font-size:14px;color:#697282">/100</span></div></div>{% endfor %}</div>
 
@@ -1850,7 +1938,7 @@ def dashboard():
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses spot Treasury yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. Primary source: MarketWatch; all three tenors fall back together to FRED daily if live parsing is unavailable. Economic 2Y confirmation also uses basis points.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses only the latest dated stance from each speaker within 7 days. Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Risk remains 50 until the next stage.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
