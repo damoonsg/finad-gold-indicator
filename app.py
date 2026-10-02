@@ -1462,7 +1462,7 @@ Rules:
 
 stance_score: -2 strongly dovish, -1 dovish, -0.5 slightly dovish, 0 neutral, +0.5 slightly hawkish, +1 hawkish, +2 strongly hawkish.
 
-You MUST return exactly ONE analysis object for EVERY supplied item id. Never omit an id, even when policy_relevant=false. Keep summary to max 24 words.
+You MUST return exactly ONE analysis object for EVERY supplied item id. NEVER renumber ids. Copy the supplied id and speaker name exactly, even when policy_relevant=false. Keep summary to max 24 words.
 
 Return ONLY valid JSON:
 {"analyses":[{"id":1,"speaker":"Name","policy_relevant":true,"selected_doc_id":1,"summary":"short factual summary","inflation_view":"NEUTRAL","labor_view":"NEUTRAL","rate_path_view":"NEUTRAL","stance_score":0.0,"confidence":85}]}
@@ -1516,36 +1516,77 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
             raise ValueError("AI response missing analyses array")
         return analyses
 
-    analyses = call_fed_ai(items, 2200)
     expected_ids = set(range(1, len(bundles) + 1))
+    speaker_to_id = {normalize_text(bundle.get("speaker") or "").strip(): i for i, bundle in enumerate(bundles, 1)}
     by_id = {}
-    for a in analyses:
-        try:
-            aid = int(a.get("id"))
-        except Exception:
-            continue
-        if aid in expected_ids:
-            by_id[aid] = a
+    recovered_ids = set()
 
-    # V6: if the large response omits one or two speakers, recover ONLY those
-    # compact bundles instead of throwing away the entire Fed score.
+    def absorb(rows, allowed_ids=None, force_single_id=None, mark_recovered=False):
+        """Map model output by exact id first, then exact speaker name.
+
+        Compact LLMs occasionally renumber ids in a recovery request. Speaker-name
+        matching prevents a valid stance from being discarded for formatting only.
+        For a one-speaker retry, any single valid object is safely mapped back to the
+        requested bundle id.
+        """
+        allowed = set(allowed_ids or expected_ids)
+        valid_rows = [a for a in (rows or []) if isinstance(a, dict)]
+        for a in valid_rows:
+            aid = None
+            try:
+                candidate_id = int(a.get("id"))
+                if candidate_id in allowed:
+                    aid = candidate_id
+            except Exception:
+                pass
+            if aid is None:
+                speaker_key = normalize_text(a.get("speaker") or "").strip()
+                candidate_id = speaker_to_id.get(speaker_key)
+                if candidate_id in allowed:
+                    aid = candidate_id
+            if aid is None and force_single_id is not None and len(valid_rows) == 1:
+                aid = force_single_id
+            if aid is None or aid not in allowed:
+                continue
+            row = dict(a)
+            row["id"] = aid
+            row["speaker"] = bundles[aid - 1].get("speaker")
+            if mark_recovered:
+                row["recovered_output"] = True
+                recovered_ids.add(aid)
+            by_id[aid] = row
+
+    analyses = call_fed_ai(items, 2200)
+    absorb(analyses)
+
+    # First recovery: retry all omitted speakers together and match by id OR speaker.
     missing = sorted(expected_ids - set(by_id))
     if missing:
         recovery_items = [x for x in items if int(x.get("id", 0)) in missing]
         try:
-            recovered = call_fed_ai(recovery_items, max(700, 420 * len(recovery_items)))
-            for a in recovered:
-                try:
-                    aid = int(a.get("id"))
-                except Exception:
-                    continue
-                if aid in expected_ids:
-                    by_id[aid] = a
+            recovered = call_fed_ai(recovery_items, max(900, 360 * len(recovery_items)))
+            absorb(recovered, allowed_ids=missing, mark_recovered=True)
         except Exception:
             pass
 
-    # If a bundle is still missing, exclude only that speaker from this cycle.
-    # Never neutralize the entire Fed component because one JSON object was omitted.
+    # V9 second recovery: one compact request per still-missing speaker. Because the
+    # request contains exactly one speaker, an otherwise-valid object can be mapped
+    # back even if the model incorrectly returns id=1. This fixes the partial-bundle
+    # failure seen in V9 without changing any stance manually.
+    still_missing = sorted(expected_ids - set(by_id))
+    for aid in list(still_missing):
+        single_item = [x for x in items if int(x.get("id", 0)) == aid]
+        if not single_item:
+            continue
+        try:
+            one = call_fed_ai(single_item, 650)
+            absorb(one, allowed_ids={aid}, force_single_id=aid, mark_recovered=True)
+        except Exception:
+            continue
+
+    # If a bundle is still missing after both recovery passes, exclude only that
+    # speaker. A placeholder is kept for diagnostics but MUST NOT become a neutral
+    # Fed stance card or influence the score.
     still_missing = sorted(expected_ids - set(by_id))
     for aid in still_missing:
         speaker = bundles[aid - 1].get("speaker") if 1 <= aid <= len(bundles) else "Unknown"
@@ -1583,6 +1624,9 @@ def _build_semantic_fed_result(bundles, analyses, candidate_count):
     for bundle_id, bundle in enumerate(bundles, 1):
         a = by_id.get(bundle_id)
         if not a:
+            continue
+        # Diagnostic placeholders are excluded from both the score and cards.
+        if a.get("recovery_missing"):
             continue
 
         policy_relevant = a.get("policy_relevant", False)
@@ -1665,7 +1709,8 @@ def _build_semantic_fed_result(bundles, analyses, candidate_count):
         "event_count": len(events),
         "candidate_count": candidate_count,
         "speaker_bundle_count": len(bundles),
-        "analyzed_count": len(analyses),
+        "analyzed_count": sum(1 for a in analyses if isinstance(a, dict) and not a.get("recovery_missing")),
+        "recovered_count": sum(1 for a in analyses if isinstance(a, dict) and a.get("recovered_output") and not a.get("recovery_missing")),
         "relevant_count": relevant_count,
         "rejected_count": max(0, len(bundles) - relevant_count),
         "average_stance": round(avg_stance, 2),
@@ -2911,6 +2956,17 @@ Materiality rule:
 - Routine domestic politics, ordinary crime, opinion pieces without a fresh development, and historical background are material=false.
 
 Even when material=false, still fill direction, stage, severity, gold_relevance, oil_relevance, and confidence using your best semantic judgment. Use NEUTRAL only when the item genuinely carries no escalation/de-escalation signal.
+
+Also classify the PLAUSIBLE GOLD TRANSMISSION CHANNEL of the geopolitical development itself. This is NOT a prediction of gold and must NOT use generic "war = gold up" logic:
+- SAFE_HAVEN: acute fear/risk-off demand could support gold.
+- OIL_INFLATION_RATES: energy/shipping disruption could lift oil/inflation/rate expectations and pressure gold.
+- USD_LIQUIDITY: dollar/liquidity demand could pressure gold.
+- TRADE_INFLATION: tariffs/export controls could lift inflation/rates and pressure gold.
+- SANCTIONS_FINANCIAL: sanctions/financial fragmentation may have mixed or directional gold effects depending on the item.
+- MIXED: credible bullish and bearish gold channels coexist.
+- NONE: no plausible direct transmission channel.
+
+gold_channel_direction must be BULLISH_GOLD, BEARISH_GOLD, MIXED, or UNCERTAIN. This describes the event's plausible mechanism only; live market confirmation is handled separately in code. Never infer causality from market moves because no market prices are supplied here.
 Use a stable event_key so separate headlines about the same real-world event receive similar labels. Do not invent facts beyond the supplied item.
 
 Calibration examples (generic, not facts about the current feed):
@@ -2920,10 +2976,10 @@ Calibration examples (generic, not facts about the current feed):
 - "A ceasefire is signed or forces begin withdrawal" => DE_ESCALATION, CEASEFIRE_DEAL or DIPLOMATIC_ACTION.
 - A headline can be evaluated from the claim it reports. If details are limited, lower confidence; do NOT zero out severity/relevance merely because only a headline is supplied.
 - Do not return an all-zero/all-NEUTRAL batch when the supplied headlines themselves report concrete strikes, deployments, sanctions, ceasefires, or trade actions.
-- CRITICAL SCALE RULE: severity, market_relevance, gold_relevance, oil_relevance, and confidence MUST each be scored on a 0-100 scale. NEVER use a 0-10 scale. Example: high severity is 75, not 7.5 or 8.
+- CRITICAL SCALE RULE: severity, market_relevance, gold_relevance, oil_relevance, gold_channel_strength, transmission_confidence, and confidence MUST each be scored on a 0-100 scale. NEVER use a 0-10 scale. Example: high severity is 75, not 7.5 or 8.
 
 Return ONLY valid JSON:
-{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"confidence":85}]}.
+{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"gold_channel":"SAFE_HAVEN|OIL_INFLATION_RATES|USD_LIQUIDITY|TRADE_INFLATION|SANCTIONS_FINANCIAL|MIXED|NONE","gold_channel_direction":"BULLISH_GOLD|BEARISH_GOLD|MIXED|UNCERTAIN","gold_channel_strength":65,"transmission_confidence":75,"confidence":85}]}.
 There must be exactly one object for every supplied id."""
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -3057,7 +3113,7 @@ def _normalize_geo_ai_metric_scale(analyses):
     Detect that batch-level scale mismatch and convert the four impact metrics only.
     Confidence is left untouched because models usually already return it as 0-100.
     """
-    fields = ("severity", "market_relevance", "gold_relevance", "oil_relevance")
+    fields = ("severity", "market_relevance", "gold_relevance", "oil_relevance", "gold_channel_strength", "transmission_confidence")
     vals = []
     for a in analyses or []:
         for field in fields:
@@ -3129,10 +3185,10 @@ def _geo_cluster_match(group, key, analysis):
 
 
 def _score_geopolitical_events(candidates, analyses):
-    """V8: score GLOBAL RISK itself, not the direction of gold.
+    """V9: score GLOBAL RISK itself, not the direction of gold.
 
     The previous engine used escalating events as automatically positive for gold.
-    V8 separates:
+    V9 separates:
       1) Global Geopolitical Risk Level / escalation momentum
       2) Gold Transmission, calculated later from live USD/yields/oil/VIX channels.
     """
@@ -3255,6 +3311,32 @@ def _score_geopolitical_events(candidates, analyses):
         market_rel = weighted_avg("market_relevance", 50)
         oil_rel = weighted_avg("oil_relevance", 0)
         conf = weighted_avg("confidence", 50)
+        channel_strength = weighted_avg("gold_channel_strength", 0)
+        transmission_conf = weighted_avg("transmission_confidence", conf)
+
+        def weighted_choice(field, allowed, default):
+            votes = {}
+            for _, src, a in members:
+                value = str(a.get(field) or default).upper().strip()
+                if value not in allowed:
+                    value = default
+                try:
+                    strength = clamp(float(a.get("gold_channel_strength", 50) or 50)) / 100.0
+                except Exception:
+                    strength = 0.5
+                votes[value] = votes.get(value, 0.0) + member_weight((0, src, a)) * max(0.25, strength)
+            return max(votes, key=votes.get) if votes else default
+
+        gold_channel = weighted_choice(
+            "gold_channel",
+            {"SAFE_HAVEN","OIL_INFLATION_RATES","USD_LIQUIDITY","TRADE_INFLATION","SANCTIONS_FINANCIAL","MIXED","NONE"},
+            "NONE",
+        )
+        gold_channel_direction = weighted_choice(
+            "gold_channel_direction",
+            {"BULLISH_GOLD","BEARISH_GOLD","MIXED","UNCERTAIN"},
+            "UNCERTAIN",
+        )
 
         stages = [str(a.get("stage") or "STATEMENT").upper() for _,_,a in members]
         stage = max(stages, key=lambda s: stage_rank.get(s,0))
@@ -3298,6 +3380,10 @@ def _score_geopolitical_events(candidates, analyses):
             "gold_relevance": round(rel,0),
             "oil_relevance": round(oil_rel,0),
             "confidence": round(conf,0),
+            "gold_channel": gold_channel,
+            "gold_channel_direction": gold_channel_direction,
+            "gold_channel_strength": round(channel_strength,0),
+            "transmission_confidence": round(transmission_conf,0),
             "risk_pressure": round(risk_pressure,2),
             # Backward-compatible field; template is relabeled in V8.
             "impact": round(risk_pressure,2),
@@ -3509,83 +3595,185 @@ def calculate_rates_engine(markets):
 
 
 def calculate_geo_gold_transmission(geopolitical, markets):
-    """Translate geopolitical risk into its CURRENT effect on gold.
+    """V9: attribute geopolitical effects to gold only when mechanism + market confirm.
 
-    High geopolitical risk is not automatically bullish for gold. The sign comes
-    from live cross-asset transmission:
-      USD up           -> headwind for gold
-      Treasury yields up -> headwind for gold
-      Oil up + yields up -> inflation / tighter-policy channel, headwind for gold
-      VIX up           -> risk-off / safe-haven channel, support for gold
+    V9 still had a causality problem: a weaker USD or lower yields could be caused by
+    macro data/Fed news, yet the Geo engine counted them as a bullish geopolitical
+    transmission. V9 requires TWO layers before assigning a directional Geo→Gold score:
 
-    The geopolitical risk level and escalation momentum amplify whichever channel
-    the market is actually transmitting. Gold's own price is intentionally NOT
-    used here, avoiding circular scoring.
+      A) semantic mechanism in the geopolitical events themselves; and
+      B) live cross-asset confirmation consistent with that mechanism.
+
+    Examples:
+      OIL_INFLATION_RATES + oil up + yields up -> bearish Geo transmission to gold.
+      SAFE_HAVEN + VIX up (+ usually yields down) -> bullish Geo transmission to gold.
+      USD/rates moving by themselves -> context only, NOT geopolitical attribution.
+
+    Gold's own price is intentionally excluded to avoid circular scoring.
     """
     risk_level = float(geopolitical.get("risk_level", geopolitical.get("score", 50.0)) or 50.0)
     momentum = float(geopolitical.get("risk_momentum", 0.0) or 0.0)
+    events = geopolitical.get("events") or []
 
     dxy_change = float(markets.get("dxy", {}).get("change_pct") or 0.0)
     oil_change = float(markets.get("oil", {}).get("change_pct") or 0.0)
     vix_change = float(markets.get("vix", {}).get("change_pct") or 0.0)
-
     rates_engine = calculate_rates_engine(markets)
     weighted_bps = float(rates_engine.get("weighted_bps") or 0.0)
 
-    dollar_channel = max(-7.0, min(7.0, -dxy_change * 10.0))
-    rates_channel = max(-7.0, min(7.0, -weighted_bps * 0.65))
-    riskoff_channel = max(-4.0, min(4.0, vix_change * 0.12))
+    # Semantic channel pressure. These are NOT scores yet; they say what mechanisms
+    # the current geopolitical events plausibly contain.
+    channel_weights = {
+        "SAFE_HAVEN_BULL": 0.0,
+        "SAFE_HAVEN_BEAR": 0.0,
+        "OIL_RATES_BEAR": 0.0,
+        "USD_BEAR": 0.0,
+        "TRADE_BEAR": 0.0,
+        "SANCTIONS_BULL": 0.0,
+        "SANCTIONS_BEAR": 0.0,
+    }
+    semantic_bull = 0.0
+    semantic_bear = 0.0
 
-    # Oil is not mechanically bullish for gold. When oil and yields rise together,
-    # the dominant short-run channel is often inflation -> tighter policy -> higher
-    # real/nominal yields, which can pressure gold.
-    if oil_change > 0 and weighted_bps > 0:
-        oil_channel = -min(6.0, oil_change * 0.75 + weighted_bps * 0.22)
-        oil_regime = "INFLATION / TIGHTENING CHANNEL"
-    elif oil_change > 0 and weighted_bps <= 0:
-        oil_channel = min(1.5, oil_change * 0.12)
-        oil_regime = "INFLATION-HEDGE / MIXED"
-    else:
-        oil_channel = 0.0
-        oil_regime = "NO OIL INFLATION PENALTY"
+    for e in events:
+        channel = str(e.get("gold_channel") or "NONE").upper()
+        direction = str(e.get("gold_channel_direction") or "UNCERTAIN").upper()
+        try:
+            strength = clamp(float(e.get("gold_channel_strength", 0) or 0)) / 100.0
+        except Exception:
+            strength = 0.0
+        try:
+            conf = clamp(float(e.get("transmission_confidence", e.get("confidence", 50)) or 50)) / 100.0
+        except Exception:
+            conf = 0.5
+        try:
+            gold_rel = clamp(float(e.get("gold_relevance", 0) or 0)) / 100.0
+        except Exception:
+            gold_rel = 0.0
+        try:
+            pressure = abs(float(e.get("risk_pressure", e.get("impact", 0)) or 0))
+        except Exception:
+            pressure = 0.0
+
+        weight = max(0.10, pressure) * strength * conf * max(0.20, gold_rel)
+        if direction == "BULLISH_GOLD":
+            semantic_bull += weight
+        elif direction == "BEARISH_GOLD":
+            semantic_bear += weight
+
+        if channel == "SAFE_HAVEN":
+            if direction == "BULLISH_GOLD":
+                channel_weights["SAFE_HAVEN_BULL"] += weight
+            elif direction == "BEARISH_GOLD":
+                channel_weights["SAFE_HAVEN_BEAR"] += weight
+        elif channel == "OIL_INFLATION_RATES" and direction == "BEARISH_GOLD":
+            channel_weights["OIL_RATES_BEAR"] += weight
+        elif channel == "USD_LIQUIDITY" and direction == "BEARISH_GOLD":
+            channel_weights["USD_BEAR"] += weight
+        elif channel == "TRADE_INFLATION" and direction == "BEARISH_GOLD":
+            channel_weights["TRADE_BEAR"] += weight
+        elif channel == "SANCTIONS_FINANCIAL":
+            if direction == "BULLISH_GOLD":
+                channel_weights["SANCTIONS_BULL"] += weight
+            elif direction == "BEARISH_GOLD":
+                channel_weights["SANCTIONS_BEAR"] += weight
+
+    # Convert accumulated semantic weights to 0..1 activation factors. Saturation
+    # prevents ten similar headlines from multiplying the same mechanism forever.
+    factors = {k: min(1.0, v / 2.5) for k, v in channel_weights.items()}
+
+    dollar_channel = 0.0
+    rates_channel = 0.0
+    oil_channel = 0.0
+    riskoff_channel = 0.0
+    confirmations = []
+
+    # 1) Oil/inflation/rates bearish channel: must see BOTH oil and yields confirming.
+    oil_bear_factor = max(factors["OIL_RATES_BEAR"], factors["TRADE_BEAR"] * 0.55)
+    if oil_bear_factor > 0.08 and oil_change >= 0.25 and weighted_bps >= 0.75:
+        oil_channel = -min(5.0, oil_change * 0.70) * oil_bear_factor
+        rates_channel += -min(5.0, weighted_bps * 0.38) * oil_bear_factor
+        confirmations.append("OIL↑ + YIELDS↑ confirm inflation/tightening channel")
+
+    # 2) Safe-haven bullish channel: VIX/risk-off must confirm. Falling yields can
+    # strengthen it, but falling yields alone can be a Fed/data story and are ignored.
+    safe_bull_factor = max(factors["SAFE_HAVEN_BULL"], factors["SANCTIONS_BULL"] * 0.45)
+    if safe_bull_factor > 0.08 and vix_change >= 0.75:
+        riskoff_channel = min(5.0, vix_change * 0.14) * safe_bull_factor
+        if weighted_bps <= -0.75:
+            rates_channel += min(3.5, abs(weighted_bps) * 0.25) * safe_bull_factor
+        confirmations.append("VIX↑ confirms safe-haven/risk-off channel")
+
+    # 3) Loss of safe-haven demand / de-escalation. VIX must be falling; otherwise
+    # we do not attribute a bearish gold move to geopolitics.
+    safe_bear_factor = factors["SAFE_HAVEN_BEAR"]
+    if safe_bear_factor > 0.08 and vix_change <= -0.75:
+        riskoff_channel = -min(4.0, abs(vix_change) * 0.12) * safe_bear_factor
+        confirmations.append("VIX↓ confirms fading safe-haven demand")
+
+    # 4) Dollar/liquidity geopolitical channel. A stronger dollar only counts when
+    # the semantic event mechanism itself points to USD/liquidity demand.
+    usd_bear_factor = max(factors["USD_BEAR"], factors["SANCTIONS_BEAR"] * 0.40)
+    if usd_bear_factor > 0.08 and dxy_change >= 0.15:
+        dollar_channel = -min(5.0, dxy_change * 8.0) * usd_bear_factor
+        confirmations.append("USD↑ confirms geopolitical liquidity/dollar channel")
 
     raw_channel = dollar_channel + rates_channel + riskoff_channel + oil_channel
 
-    # High risk / strong escalation does not pick the sign; it amplifies the sign
-    # already visible in cross-assets.
+    # Risk level/momentum may amplify a CONFIRMED transmission, but never choose its
+    # sign and never create a signal from unrelated cross-asset moves.
     intensity = 1.0
-    if risk_level > 50:
-        intensity += min(0.35, (risk_level - 50.0) / 70.0)
-    intensity += min(0.20, abs(momentum) / 500.0)
+    if abs(raw_channel) > 0.05:
+        if risk_level > 50:
+            intensity += min(0.25, (risk_level - 50.0) / 90.0)
+        intensity += min(0.12, abs(momentum) / 700.0)
 
     delta = raw_channel * intensity
-    score = clamp(50.0 + delta, 20.0, 80.0)
+    score = clamp(50.0 + delta, 30.0, 70.0)
 
-    if score >= 58:
-        regime = "GEOPOLITICS TRANSMITTING BULLISHLY TO GOLD"
-    elif score <= 42:
-        regime = "GEOPOLITICS TRANSMITTING BEARISHLY TO GOLD"
-    elif score >= 53:
-        regime = "MILDLY SUPPORTIVE FOR GOLD"
-    elif score <= 47:
-        regime = "MILD HEADWIND FOR GOLD"
+    if not confirmations or abs(delta) < 0.35:
+        score = 50.0
+        regime = "GEO→GOLD ATTRIBUTION UNCONFIRMED / NEUTRAL"
+        attribution_status = "UNCONFIRMED"
+    elif delta >= 5.0:
+        regime = "CONFIRMED BULLISH GEO TRANSMISSION TO GOLD"
+        attribution_status = "CONFIRMED BULLISH"
+    elif delta <= -5.0:
+        regime = "CONFIRMED BEARISH GEO TRANSMISSION TO GOLD"
+        attribution_status = "CONFIRMED BEARISH"
+    elif delta > 0:
+        regime = "MILD CONFIRMED GEO SUPPORT FOR GOLD"
+        attribution_status = "PARTIAL BULLISH"
     else:
-        regime = "MIXED / NEUTRAL GOLD TRANSMISSION"
+        regime = "MILD CONFIRMED GEO HEADWIND FOR GOLD"
+        attribution_status = "PARTIAL BEARISH"
+
+    if semantic_bull > semantic_bear * 1.25:
+        semantic_bias = "BULLISH POTENTIAL"
+    elif semantic_bear > semantic_bull * 1.25:
+        semantic_bias = "BEARISH POTENTIAL"
+    else:
+        semantic_bias = "MIXED / UNCERTAIN"
 
     return {
         "score": round(score, 1),
         "regime": regime,
+        "attribution_status": attribution_status,
+        "semantic_bias": semantic_bias,
+        "confirmation_count": len(confirmations),
+        "confirmations": confirmations[:4],
         "raw_channel": round(raw_channel, 2),
         "intensity": round(intensity, 2),
         "dollar_channel": round(dollar_channel, 2),
         "rates_channel": round(rates_channel, 2),
         "oil_channel": round(oil_channel, 2),
         "riskoff_channel": round(riskoff_channel, 2),
-        "oil_regime": oil_regime,
         "dxy_change": round(dxy_change, 3),
         "weighted_bps": round(weighted_bps, 2),
         "oil_change": round(oil_change, 3),
         "vix_change": round(vix_change, 3),
+        "semantic_bull_pressure": round(semantic_bull, 2),
+        "semantic_bear_pressure": round(semantic_bear, 2),
     }
 
 def calculate_scores(markets, fed_score, economic_score, geopolitical_gold_score):
@@ -3736,7 +3924,7 @@ def _initial_dashboard_data():
             "events": [], "event_count": 0,
         },
         "fed": {"score": 50.0, "events": [], "event_count": 0, "average_stance": 0.0, "mode": "AI SEMANTIC", "model": GROQ_MODEL, "status": "INITIALIZING"},
-        "geopolitical": {"score": 50.0, "risk_level": 50.0, "regime": "INITIALIZING", "risk_momentum": 0.0, "momentum_label": "INITIALIZING", "gold_transmission_score": 50.0, "gold_transmission_regime": "INITIALIZING", "gold_transmission": {"score":50.0,"regime":"INITIALIZING","dollar_channel":0.0,"rates_channel":0.0,"oil_channel":0.0,"riskoff_channel":0.0,"raw_channel":0.0,"intensity":1.0}, "events": [], "event_count": 0, "escalating": 0, "deescalating": 0, "net_impact": 0.0, "status": "INITIALIZING", "source_stats": {}},
+        "geopolitical": {"score": 50.0, "risk_level": 50.0, "regime": "INITIALIZING", "risk_momentum": 0.0, "momentum_label": "INITIALIZING", "gold_transmission_score": 50.0, "gold_transmission_regime": "INITIALIZING", "gold_transmission": {"score":50.0,"regime":"INITIALIZING","attribution_status":"INITIALIZING","semantic_bias":"INITIALIZING","confirmation_count":0,"confirmations":[],"dollar_channel":0.0,"rates_channel":0.0,"oil_channel":0.0,"riskoff_channel":0.0,"raw_channel":0.0,"intensity":1.0}, "events": [], "event_count": 0, "escalating": 0, "deescalating": 0, "net_impact": 0.0, "status": "INITIALIZING", "source_stats": {}},
         "telegram_news": [], "utotimes_news": [],
         "updated": "Waiting for first data refresh…",
         "initializing": True,
@@ -3863,7 +4051,9 @@ def dashboard():
 <div class="note" style="margin-top:5px"><strong>{{ data.geopolitical.gold_transmission_regime|default("Gold transmission pending") }}</strong></div>
 <div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong>{% if data.geopolitical.ai_scale_normalized %} • Score scale: <strong>normalized 0-10 → 0-100</strong>{% endif %}</div>
 {% if data.geopolitical.gold_transmission %}
-<div class="note">Gold transmission channels: USD <strong class="{% if data.geopolitical.gold_transmission.dollar_channel>0 %}positive{% elif data.geopolitical.gold_transmission.dollar_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.dollar_channel }}</strong> • Rates <strong class="{% if data.geopolitical.gold_transmission.rates_channel>0 %}positive{% elif data.geopolitical.gold_transmission.rates_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.rates_channel }}</strong> • Oil/Inflation <strong class="{% if data.geopolitical.gold_transmission.oil_channel>0 %}positive{% elif data.geopolitical.gold_transmission.oil_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.oil_channel }}</strong> • Risk-off/VIX <strong class="{% if data.geopolitical.gold_transmission.riskoff_channel>0 %}positive{% elif data.geopolitical.gold_transmission.riskoff_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.riskoff_channel }}</strong> • Risk amplifier ×{{ data.geopolitical.gold_transmission.intensity }}</div>
+<div class="note">Attribution: <strong>{{ data.geopolitical.gold_transmission.attribution_status|default("UNCONFIRMED") }}</strong> • Event mechanism: <strong>{{ data.geopolitical.gold_transmission.semantic_bias|default("MIXED / UNCERTAIN") }}</strong> • Confirmed channels: <strong>{{ data.geopolitical.gold_transmission.confirmation_count|default(0) }}</strong></div>
+<div class="note">Gold transmission channels: USD <strong class="{% if data.geopolitical.gold_transmission.dollar_channel>0 %}positive{% elif data.geopolitical.gold_transmission.dollar_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.dollar_channel }}</strong> • Rates <strong class="{% if data.geopolitical.gold_transmission.rates_channel>0 %}positive{% elif data.geopolitical.gold_transmission.rates_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.rates_channel }}</strong> • Oil/Inflation <strong class="{% if data.geopolitical.gold_transmission.oil_channel>0 %}positive{% elif data.geopolitical.gold_transmission.oil_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.oil_channel }}</strong> • Risk-off/VIX <strong class="{% if data.geopolitical.gold_transmission.riskoff_channel>0 %}positive{% elif data.geopolitical.gold_transmission.riskoff_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.riskoff_channel }}</strong> • Confirmed-risk amplifier ×{{ data.geopolitical.gold_transmission.intensity }}</div>
+{% if data.geopolitical.gold_transmission.confirmations %}<div class="note">Confirmation: {% for c in data.geopolitical.gold_transmission.confirmations %}{{ c }}{% if not loop.last %} • {% endif %}{% endfor %}</div>{% endif %}
 {% endif %}
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
 {% if data.geopolitical.event_count == 0 and data.geopolitical.candidate_diagnostics %}
@@ -3881,6 +4071,7 @@ def dashboard():
 {% set geoclass='tone-hawkish' if event.direction=='ESCALATION' else ('tone-dovish' if event.direction=='DE_ESCALATION' else '') %}
 <div class="tone {{ geoclass }}">{{ event.direction }} • {{ event.stage }}</div>
 <div class="impact">Severity: {{ event.severity }}/100 • Gold relevance: {{ event.gold_relevance }}/100 • Confidence: {{ event.confidence }}% • Risk pressure: {% if event.risk_pressure|default(event.impact)>0 %}+{% endif %}{{ event.risk_pressure|default(event.impact) }}</div>
+<div class="note">Gold mechanism: <strong>{{ event.gold_channel|default("NONE") }}</strong> • {{ event.gold_channel_direction|default("UNCERTAIN") }} • strength {{ event.gold_channel_strength|default(0) }}/100</div>
 <div class="event-title" style="margin-top:8px">{{ event.summary }}</div>
 <div class="note" style="margin-top:8px">Sources: {{ event.source_count }} • {% for s in event.sources %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
 <div class="news-meta">{{ event.date or '' }}</div>
@@ -3895,7 +4086,7 @@ def dashboard():
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <span class="note"> • {{ data.fed.event_count }} latest policy stances{% if data.fed.candidate_count is defined %} from {{ data.fed.candidate_count }} recent candidate documents{% endif %} • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
-{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidate documents: <strong>{{ data.fed.candidate_count }}</strong>{% if data.fed.speaker_bundle_count is defined %} • Speaker bundles sent to AI: <strong>{{ data.fed.speaker_bundle_count }}</strong>{% endif %} • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.missing_bundle_count is defined %} • Unrecovered speaker bundles: <strong>{{ data.fed.missing_bundle_count }}</strong>{% endif %}{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
+{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidate documents: <strong>{{ data.fed.candidate_count }}</strong>{% if data.fed.speaker_bundle_count is defined %} • Speaker bundles sent to AI: <strong>{{ data.fed.speaker_bundle_count }}</strong>{% endif %} • Valid AI speaker analyses: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.recovered_count is defined %} • Recovered: <strong>{{ data.fed.recovered_count }}</strong>{% endif %}{% if data.fed.missing_bundle_count is defined %} • Unrecovered speaker bundles: <strong>{{ data.fed.missing_bundle_count }}</strong>{% endif %}{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
 {% if data.fed.error %}<div class="note" style="color:#e6a36f">Fed engine detail: {{ data.fed.error }}</div>{% endif %}
 <div class="note">Source policy: <strong>Official Federal Reserve System sources are primary</strong>; UtoFX/UtoTimes are secondary for timely quotes/Q&amp;A. If sources conflict, the official Fed source wins.</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
@@ -3920,7 +4111,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitics V8 separates Global Risk Level from Gold Transmission. AI clusters duplicate worldwide events and measures escalation momentum; only the live transmission through USD, Treasury yields, oil/inflation and VIX enters the Gold Intelligence Score. High geopolitical risk is not assumed to be bullish for gold.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitics V9 separates Global Risk Level from Gold Transmission. AI clusters duplicate worldwide events and measures escalation momentum; only the live transmission through USD, Treasury yields, oil/inflation and VIX enters the Gold Intelligence Score. High geopolitical risk is not assumed to be bullish for gold.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
