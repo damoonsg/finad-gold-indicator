@@ -1489,45 +1489,81 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
             "documents": doc_items,
         })
 
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps({"speaker_bundles": items}, ensure_ascii=False)},
-        ],
-        "temperature": 0.05,
-        "max_tokens": 2200,
-        "response_format": {"type": "json_object"},
-    }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 25))
-    if r.status_code == 429:
-        retry_after = r.headers.get("retry-after", "unknown")
-        raise RuntimeError(f"GROQ RATE LIMIT (retry-after {retry_after}s)")
-    r.raise_for_status()
-    data = r.json()
-    content = data["choices"][0]["message"]["content"]
-    parsed = _parse_json_object(content)
-    analyses = parsed.get("analyses")
-    if not isinstance(analyses, list):
-        raise ValueError("AI response missing analyses array")
 
+    def call_fed_ai(bundle_items, max_tokens=2200):
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps({"speaker_bundles": bundle_items}, ensure_ascii=False)},
+            ],
+            "temperature": 0.05,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 25))
+        if r.status_code == 429:
+            retry_after = r.headers.get("retry-after", "unknown")
+            raise RuntimeError(f"GROQ RATE LIMIT (retry-after {retry_after}s)")
+        if r.status_code >= 400:
+            detail = (r.text or "").replace("\n", " ")[:350]
+            raise RuntimeError(f"GROQ HTTP {r.status_code}: {detail}")
+        content = r.json()["choices"][0]["message"]["content"]
+        parsed = _parse_json_object(content)
+        analyses = parsed.get("analyses")
+        if not isinstance(analyses, list):
+            raise ValueError("AI response missing analyses array")
+        return analyses
+
+    analyses = call_fed_ai(items, 2200)
     expected_ids = set(range(1, len(bundles) + 1))
-    returned_ids = set()
-    cleaned = []
+    by_id = {}
     for a in analyses:
         try:
             aid = int(a.get("id"))
         except Exception:
             continue
-        if aid in expected_ids and aid not in returned_ids:
-            returned_ids.add(aid)
-            cleaned.append(a)
+        if aid in expected_ids:
+            by_id[aid] = a
 
-    missing = sorted(expected_ids - returned_ids)
+    # V6: if the large response omits one or two speakers, recover ONLY those
+    # compact bundles instead of throwing away the entire Fed score.
+    missing = sorted(expected_ids - set(by_id))
     if missing:
-        raise RuntimeError(f"INCOMPLETE AI RESPONSE missing bundle ids {missing}")
+        recovery_items = [x for x in items if int(x.get("id", 0)) in missing]
+        try:
+            recovered = call_fed_ai(recovery_items, max(700, 420 * len(recovery_items)))
+            for a in recovered:
+                try:
+                    aid = int(a.get("id"))
+                except Exception:
+                    continue
+                if aid in expected_ids:
+                    by_id[aid] = a
+        except Exception:
+            pass
 
+    # If a bundle is still missing, exclude only that speaker from this cycle.
+    # Never neutralize the entire Fed component because one JSON object was omitted.
+    still_missing = sorted(expected_ids - set(by_id))
+    for aid in still_missing:
+        speaker = bundles[aid - 1].get("speaker") if 1 <= aid <= len(bundles) else "Unknown"
+        by_id[aid] = {
+            "id": aid,
+            "speaker": speaker,
+            "policy_relevant": False,
+            "selected_doc_id": None,
+            "summary": "AI output missing for this speaker in this refresh.",
+            "inflation_view": "NOT DISCUSSED",
+            "labor_view": "NOT DISCUSSED",
+            "rate_path_view": "NOT DISCUSSED",
+            "stance_score": 0.0,
+            "confidence": 0,
+            "recovery_missing": True,
+        }
+
+    cleaned = [by_id[i] for i in sorted(by_id)]
     return bundles, cleaned
 
 
@@ -1636,7 +1672,8 @@ def _build_semantic_fed_result(bundles, analyses, candidate_count):
         "mode": "AI SEMANTIC • FED + UTO",
         "model": GROQ_MODEL,
         "source_scope": "Official Federal Reserve System sources + UtoFX/UtoTimes secondary reporting",
-        "status": "OK",
+        "status": "OK" if not any(a.get("recovery_missing") for a in analyses if isinstance(a, dict)) else "OK • PARTIAL SPEAKER RECOVERY",
+        "missing_bundle_count": sum(1 for a in analyses if isinstance(a, dict) and a.get("recovery_missing")),
     }
 
 def get_fed_monitor(telegram_news, utotimes_news):
@@ -2876,8 +2913,16 @@ Materiality rule:
 Even when material=false, still fill direction, stage, severity, gold_relevance, oil_relevance, and confidence using your best semantic judgment. Use NEUTRAL only when the item genuinely carries no escalation/de-escalation signal.
 Use a stable event_key so separate headlines about the same real-world event receive similar labels. Do not invent facts beyond the supplied item.
 
+Calibration examples (generic, not facts about the current feed):
+- "Country A deploys 10,000 troops and a carrier toward a conflict zone" => ESCALATION, PREPARATION, clearly non-zero severity and market relevance.
+- "Missiles hit a capital/port/refinery" => ESCALATION, CONFIRMED_ACTION or ACTIVE_CONFLICT if the headline reports it as having occurred.
+- "New sanctions/export controls/tariffs are imposed" => ESCALATION, SANCTIONS_ACTION or TRADE_ACTION, with non-zero market relevance.
+- "A ceasefire is signed or forces begin withdrawal" => DE_ESCALATION, CEASEFIRE_DEAL or DIPLOMATIC_ACTION.
+- A headline can be evaluated from the claim it reports. If details are limited, lower confidence; do NOT zero out severity/relevance merely because only a headline is supplied.
+- Do not return an all-zero/all-NEUTRAL batch when the supplied headlines themselves report concrete strikes, deployments, sanctions, ceasefires, or trade actions.
+
 Return ONLY valid JSON:
-{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":0,"gold_relevance":0,"oil_relevance":0,"confidence":0}]}.
+{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":0,"market_relevance":0,"gold_relevance":0,"oil_relevance":0,"confidence":0}]}.
 There must be exactly one object for every supplied id."""
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -2961,8 +3006,35 @@ There must be exactly one object for every supplied id."""
                     all_errors.append(f"recovery {model}: {recovery_exc}")
 
             clean = [by_id[i] for i in sorted(by_id)]
-            # Accept a useful partial result after recovery; diagnostics expose any missing IDs.
             if clean:
+                # V6 semantic quality gate: V5 showed that a model can return all
+                # requested IDs yet classify every geopolitical headline as zero/neutral.
+                # That is structurally valid but analytically useless. In that case
+                # try the independent fallback model instead of silently scoring 50.
+                signal_count = 0
+                for a in clean:
+                    try:
+                        sev = float(a.get("severity", 0) or 0)
+                    except Exception:
+                        sev = 0
+                    try:
+                        rel = float(a.get("gold_relevance", 0) or 0)
+                    except Exception:
+                        rel = 0
+                    try:
+                        mrel = float(a.get("market_relevance", 0) or 0)
+                    except Exception:
+                        mrel = 0
+                    direction = str(a.get("direction") or "NEUTRAL").upper()
+                    stage = str(a.get("stage") or "STATEMENT").upper()
+                    if (
+                        (direction in ("ESCALATION", "DE_ESCALATION") and (sev >= 12 or rel >= 10 or mrel >= 15))
+                        or stage in ("PREPARATION", "CONFIRMED_ACTION", "ACTIVE_CONFLICT", "CEASEFIRE_DEAL", "SANCTIONS_ACTION", "TRADE_ACTION")
+                    ):
+                        signal_count += 1
+                if len(clean) >= 5 and signal_count == 0:
+                    all_errors.append(f"Degenerate low-signal Geo response on {model}: 0/{len(clean)} semantic signals")
+                    continue
                 return clean, model
             all_errors.append(f"No valid Geo analyses returned by {model}")
         except Exception as exc:
@@ -3005,23 +3077,27 @@ def _score_geopolitical_events(candidates, analyses):
             sev = clamp(float(a.get("severity", 0)))
         except Exception:
             sev = 0
+        try:
+            market_rel = clamp(float(a.get("market_relevance", 0)))
+        except Exception:
+            market_rel = 0
         direction = str(a.get("direction") or "NEUTRAL").upper()
         stage = str(a.get("stage") or "STATEMENT").upper()
 
-        # V5 semantic floor: the model's structured severity/relevance/direction can
+        # V6 semantic floor: use the model's graded meaning, not only its Boolean.
         # rescue an item even if its boolean material flag is over-conservative.
         # This is still semantic scoring, not keyword scoring.
         semantic_floor = (
             direction in ("ESCALATION", "DE_ESCALATION")
-            and sev >= 22
-            and rel >= 18
+            and sev >= 15
+            and (rel >= 12 or market_rel >= 25)
         )
         concrete_action_floor = (
             stage in ("PREPARATION", "CONFIRMED_ACTION", "ACTIVE_CONFLICT",
                       "CEASEFIRE_DEAL", "SANCTIONS_ACTION", "TRADE_ACTION",
                       "DIPLOMATIC_ACTION")
-            and rel >= 15
-            and sev >= 18
+            and sev >= 12
+            and (rel >= 10 or market_rel >= 20)
         )
         if not (flag or semantic_floor or concrete_action_floor):
             continue
@@ -3211,6 +3287,27 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
         result["candidate_count"] = len(candidates)
         result["ai_analysis_count"] = len(analyses)
         result["ai_missing_count"] = max(0, len(candidates) - len(analyses))
+        by_ai_id = {}
+        for a in analyses:
+            try:
+                by_ai_id[int(a.get("id"))] = a
+            except Exception:
+                pass
+        result["candidate_diagnostics"] = []
+        for i, c in enumerate(candidates[:8], 1):
+            a = by_ai_id.get(i, {})
+            result["candidate_diagnostics"].append({
+                "id": i,
+                "headline": str(c.get("title") or c.get("text") or "")[:180],
+                "source": c.get("source"),
+                "topic": c.get("topic", "OTHER"),
+                "direction": str(a.get("direction") or "-")[:24],
+                "stage": str(a.get("stage") or "-")[:30],
+                "severity": a.get("severity", "-"),
+                "market_relevance": a.get("market_relevance", "-"),
+                "gold_relevance": a.get("gold_relevance", "-"),
+                "material": a.get("material", "-"),
+            })
         GEO_AI_CACHE.update({"fingerprint":fingerprint,"result":result,"time":now})
     except Exception as exc:
         previous = GEO_AI_CACHE.get("result")
@@ -3557,6 +3654,11 @@ def dashboard():
 <div class="news-title">{{ data.geopolitical.regime }}</div>
 <div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong></div>
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
+{% if data.geopolitical.event_count == 0 and data.geopolitical.candidate_diagnostics %}
+<details style="margin-top:10px"><summary class="note" style="cursor:pointer">Show Geo candidate diagnostics</summary>
+{% for d in data.geopolitical.candidate_diagnostics %}<div class="note" style="border-top:1px solid #222a39;padding-top:7px;margin-top:7px"><strong>#{{ d.id }} {{ d.topic }}</strong> • {{ d.source }} • {{ d.direction }}/{{ d.stage }} • severity {{ d.severity }} • market {{ d.market_relevance }} • gold {{ d.gold_relevance }} • material {{ d.material }}<br>{{ d.headline }}</div>{% endfor %}
+</details>
+{% endif %}
 </div>
 <div class="fed-grid">
 {% if data.geopolitical.events %}
@@ -3581,7 +3683,7 @@ def dashboard():
 Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 <span class="note"> • {{ data.fed.event_count }} latest policy stances{% if data.fed.candidate_count is defined %} from {{ data.fed.candidate_count }} recent candidate documents{% endif %} • {{ data.fed.mode }}{% if data.fed.model %} • {{ data.fed.model }}{% endif %}</span>
 <div class="note">Status: <strong>{{ data.fed.status }}</strong>{% if data.fed.average_stance is defined %} • Weighted stance: {{ data.fed.average_stance }} (-2 dovish → +2 hawkish){% endif %}</div>
-{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidate documents: <strong>{{ data.fed.candidate_count }}</strong>{% if data.fed.speaker_bundle_count is defined %} • Speaker bundles sent to AI: <strong>{{ data.fed.speaker_bundle_count }}</strong>{% endif %} • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
+{% if data.fed.analyzed_count is defined %}<div class="note">Fed candidate documents: <strong>{{ data.fed.candidate_count }}</strong>{% if data.fed.speaker_bundle_count is defined %} • Speaker bundles sent to AI: <strong>{{ data.fed.speaker_bundle_count }}</strong>{% endif %} • AI analyses returned: <strong>{{ data.fed.analyzed_count }}</strong>{% if data.fed.missing_bundle_count is defined %} • Unrecovered speaker bundles: <strong>{{ data.fed.missing_bundle_count }}</strong>{% endif %}{% if data.fed.official_discovered is defined %} • Official discovered: <strong>{{ data.fed.official_discovered }}</strong> • Uto discovered: <strong>{{ data.fed.uto_discovered }}</strong>{% endif %}</div>{% endif %}
 {% if data.fed.error %}<div class="note" style="color:#e6a36f">Fed engine detail: {{ data.fed.error }}</div>{% endif %}
 <div class="note">Source policy: <strong>Official Federal Reserve System sources are primary</strong>; UtoFX/UtoTimes are secondary for timely quotes/Q&amp;A. If sources conflict, the official Fed source wins.</div>
 {% if data.fed.status == 'API KEY MISSING' %}<div class="note" style="margin-top:6px">GROQ_API_KEY is not configured. Fed score is neutralized to 50 until semantic AI is available.</div>{% endif %}
