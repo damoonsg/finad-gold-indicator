@@ -30,6 +30,7 @@ FED_CACHE = {"time": 0, "result": None}
 FED_CACHE_SECONDS = 300
 FED_AI_CACHE = {"fingerprint": None, "result": None, "time": 0}
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+FED_GROQ_FALLBACK_MODEL = os.environ.get("FED_GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 FED_MAX_DOCUMENTS = 18
 FED_DOC_CHAR_LIMIT = 950
@@ -1433,11 +1434,13 @@ def _fed_speaker_bundles(documents):
 
 
 def _groq_semantic_fed_analysis(documents):
-    """Analyze one compact bundle per speaker in a single Groq request.
+    """V11: resilient semantic Fed analysis, speaker by speaker when needed.
 
-    v9 sent 12 document-level items and the model sometimes returned only a few
-    analyses. v10 asks for exactly one result per SPEAKER bundle and validates
-    that every bundle came back before a score is accepted.
+    The primary 120b model remains preferred. If the large all-speaker request is
+    rate-limited, truncated, or temporarily unavailable, V11 falls back to a
+    smaller semantic model and then retries only missing speakers in small chunks
+    and finally one-by-one. A failed first request therefore no longer forces the
+    whole Fed monitor to reuse a stale result.
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -1483,56 +1486,73 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
                 "policy_relevant_title_hint": _title_policy_relevance_hint(doc.get("title") or ""),
                 "text": _policy_excerpt(doc.get("text") or "", doc.get("title") or "", max_chars=FED_DOC_CHAR_LIMIT),
             })
-        items.append({
-            "id": bundle_id,
-            "speaker": bundle["speaker"],
-            "documents": doc_items,
-        })
+        items.append({"id": bundle_id, "speaker": bundle["speaker"], "documents": doc_items})
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    fed_models = []
+    for model in (GROQ_MODEL, FED_GROQ_FALLBACK_MODEL, GEO_GROQ_FALLBACK_MODEL):
+        if model and model not in fed_models:
+            fed_models.append(model)
 
     def call_fed_ai(bundle_items, max_tokens=2200):
-        payload = {
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps({"speaker_bundles": bundle_items}, ensure_ascii=False)},
-            ],
-            "temperature": 0.05,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        }
-        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 25))
-        if r.status_code == 429:
-            retry_after = r.headers.get("retry-after", "unknown")
-            raise RuntimeError(f"GROQ RATE LIMIT (retry-after {retry_after}s)")
-        if r.status_code >= 400:
-            detail = (r.text or "").replace("\n", " ")[:350]
-            raise RuntimeError(f"GROQ HTTP {r.status_code}: {detail}")
-        content = r.json()["choices"][0]["message"]["content"]
-        parsed = _parse_json_object(content)
-        analyses = parsed.get("analyses")
-        if not isinstance(analyses, list):
-            raise ValueError("AI response missing analyses array")
-        return analyses
+        errors = []
+        for model in fed_models:
+            base_payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps({"speaker_bundles": bundle_items}, ensure_ascii=False)},
+                ],
+                "temperature": 0.05,
+                "max_tokens": max_tokens,
+            }
+            if model.startswith("openai/gpt-oss-"):
+                base_payload["reasoning_effort"] = "low"
+
+            # JSON mode is preferred, but a model-specific JSON-mode failure should
+            # not discard an otherwise usable semantic response.
+            for use_json_mode in (True, False):
+                payload = dict(base_payload)
+                if use_json_mode:
+                    payload["response_format"] = {"type": "json_object"}
+                try:
+                    r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 28))
+                    if r.status_code == 429:
+                        retry_after = r.headers.get("retry-after", "unknown")
+                        raise RuntimeError(f"GROQ RATE LIMIT on {model} (retry-after {retry_after}s)")
+                    if r.status_code >= 400:
+                        detail = (r.text or "").replace("\n", " ")[:420]
+                        if r.status_code == 400 and use_json_mode:
+                            errors.append(f"GROQ HTTP 400 on {model}: {detail}")
+                            continue
+                        raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
+                    content = r.json()["choices"][0]["message"]["content"]
+                    parsed = _parse_json_object(content)
+                    analyses = parsed.get("analyses")
+                    if not isinstance(analyses, list):
+                        raise ValueError("AI response missing analyses array")
+                    return analyses, model
+                except Exception as exc:
+                    errors.append(str(exc))
+                    if use_json_mode:
+                        continue
+                    break
+        raise RuntimeError(" | ".join(errors)[-1200:])
 
     expected_ids = set(range(1, len(bundles) + 1))
     speaker_to_id = {normalize_text(bundle.get("speaker") or "").strip(): i for i, bundle in enumerate(bundles, 1)}
     by_id = {}
     recovered_ids = set()
+    errors = []
 
-    def absorb(rows, allowed_ids=None, force_single_id=None, mark_recovered=False):
-        """Map model output by exact id first, then exact speaker name.
-
-        Compact LLMs occasionally renumber ids in a recovery request. Speaker-name
-        matching prevents a valid stance from being discarded for formatting only.
-        For a one-speaker retry, any single valid object is safely mapped back to the
-        requested bundle id.
-        """
-        allowed = set(allowed_ids or expected_ids)
+    def absorb(rows, allowed_ids=None, force_single_id=None, mark_recovered=False, model_used=None, allow_local_renumber=False):
+        allowed_order = sorted(set(allowed_ids or expected_ids))
+        allowed = set(allowed_order)
+        local_map = {i + 1: aid for i, aid in enumerate(allowed_order)}
         valid_rows = [a for a in (rows or []) if isinstance(a, dict)]
         for a in valid_rows:
             aid = None
+            candidate_id = None
             try:
                 candidate_id = int(a.get("id"))
                 if candidate_id in allowed:
@@ -1541,9 +1561,13 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
                 pass
             if aid is None:
                 speaker_key = normalize_text(a.get("speaker") or "").strip()
-                candidate_id = speaker_to_id.get(speaker_key)
-                if candidate_id in allowed:
-                    aid = candidate_id
+                mapped = speaker_to_id.get(speaker_key)
+                if mapped in allowed:
+                    aid = mapped
+            # Some compact models renumber a recovery batch 1..N. For a batch
+            # whose allowed ids are e.g. [5,7,9], map local 1,2,3 back safely.
+            if aid is None and allow_local_renumber and candidate_id in local_map:
+                aid = local_map[candidate_id]
             if aid is None and force_single_id is not None and len(valid_rows) == 1:
                 aid = force_single_id
             if aid is None or aid not in allowed:
@@ -1551,58 +1575,64 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
             row = dict(a)
             row["id"] = aid
             row["speaker"] = bundles[aid - 1].get("speaker")
+            if model_used:
+                row["_ai_model"] = model_used
             if mark_recovered:
                 row["recovered_output"] = True
                 recovered_ids.add(aid)
             by_id[aid] = row
 
-    analyses = call_fed_ai(items, 2200)
-    absorb(analyses)
+    # Fast path: one request for all speakers. Failure here is no longer fatal.
+    try:
+        rows, model_used = call_fed_ai(items, 2200)
+        absorb(rows, model_used=model_used)
+    except Exception as exc:
+        errors.append(f"initial: {exc}")
 
-    # First recovery: retry all omitted speakers together and match by id OR speaker.
+    # Recover missing speakers in small batches. Small payloads are much less prone
+    # to output truncation and also allow a fallback model to take over cleanly.
     missing = sorted(expected_ids - set(by_id))
-    if missing:
-        recovery_items = [x for x in items if int(x.get("id", 0)) in missing]
+    for offset in range(0, len(missing), 3):
+        chunk_ids = missing[offset:offset + 3]
+        chunk_items = [x for x in items if int(x.get("id", 0)) in chunk_ids]
+        if not chunk_items:
+            continue
         try:
-            recovered = call_fed_ai(recovery_items, max(900, 360 * len(recovery_items)))
-            absorb(recovered, allowed_ids=missing, mark_recovered=True)
-        except Exception:
-            pass
+            rows, model_used = call_fed_ai(chunk_items, max(800, 420 * len(chunk_items)))
+            absorb(rows, allowed_ids=chunk_ids, mark_recovered=True, model_used=model_used, allow_local_renumber=True)
+        except Exception as exc:
+            errors.append(f"chunk {chunk_ids}: {exc}")
 
-    # V9 second recovery: one compact request per still-missing speaker. Because the
-    # request contains exactly one speaker, an otherwise-valid object can be mapped
-    # back even if the model incorrectly returns id=1. This fixes the partial-bundle
-    # failure seen in V9 without changing any stance manually.
+    # Final one-speaker retry. Any single valid object can be mapped to that speaker
+    # even if the model incorrectly emits id=1.
     still_missing = sorted(expected_ids - set(by_id))
-    for aid in list(still_missing):
+    for aid in still_missing:
         single_item = [x for x in items if int(x.get("id", 0)) == aid]
         if not single_item:
             continue
         try:
-            one = call_fed_ai(single_item, 650)
-            absorb(one, allowed_ids={aid}, force_single_id=aid, mark_recovered=True)
-        except Exception:
-            continue
+            rows, model_used = call_fed_ai(single_item, 700)
+            absorb(rows, allowed_ids={aid}, force_single_id=aid, mark_recovered=True, model_used=model_used, allow_local_renumber=True)
+        except Exception as exc:
+            errors.append(f"single {aid}: {exc}")
 
-    # If a bundle is still missing after both recovery passes, exclude only that
-    # speaker. A placeholder is kept for diagnostics but MUST NOT become a neutral
-    # Fed stance card or influence the score.
+    # Keep diagnostic placeholders for any genuinely unrecovered speaker, but they
+    # are excluded from cards and score by _build_semantic_fed_result.
     still_missing = sorted(expected_ids - set(by_id))
     for aid in still_missing:
         speaker = bundles[aid - 1].get("speaker") if 1 <= aid <= len(bundles) else "Unknown"
         by_id[aid] = {
-            "id": aid,
-            "speaker": speaker,
-            "policy_relevant": False,
+            "id": aid, "speaker": speaker, "policy_relevant": False,
             "selected_doc_id": None,
             "summary": "AI output missing for this speaker in this refresh.",
-            "inflation_view": "NOT DISCUSSED",
-            "labor_view": "NOT DISCUSSED",
-            "rate_path_view": "NOT DISCUSSED",
-            "stance_score": 0.0,
-            "confidence": 0,
-            "recovery_missing": True,
+            "inflation_view": "NOT DISCUSSED", "labor_view": "NOT DISCUSSED",
+            "rate_path_view": "NOT DISCUSSED", "stance_score": 0.0,
+            "confidence": 0, "recovery_missing": True,
         }
+
+    valid_count = sum(1 for a in by_id.values() if not a.get("recovery_missing"))
+    if valid_count == 0:
+        raise RuntimeError("FED AI produced no valid current speaker analyses | " + " | ".join(errors)[-900:])
 
     cleaned = [by_id[i] for i in sorted(by_id)]
     return bundles, cleaned
@@ -1715,7 +1745,7 @@ def _build_semantic_fed_result(bundles, analyses, candidate_count):
         "rejected_count": max(0, len(bundles) - relevant_count),
         "average_stance": round(avg_stance, 2),
         "mode": "AI SEMANTIC • FED + UTO",
-        "model": GROQ_MODEL,
+        "model": " + ".join(dict.fromkeys([str(a.get("_ai_model")) for a in analyses if isinstance(a, dict) and a.get("_ai_model")])) or GROQ_MODEL,
         "source_scope": "Official Federal Reserve System sources + UtoFX/UtoTimes secondary reporting",
         "status": "OK" if not any(a.get("recovery_missing") for a in analyses if isinstance(a, dict)) else "OK • PARTIAL SPEAKER RECOVERY",
         "missing_bundle_count": sum(1 for a in analyses if isinstance(a, dict) and a.get("recovery_missing")),
@@ -3034,43 +3064,71 @@ There must be exactly one object for every supplied id."""
     all_errors = []
     expected_ids = {int(d["id"]) for d in docs}
 
+    def absorb_geo(rows, by_id, allowed_ids, allow_local_renumber=False, force_single_id=None):
+        allowed_order = sorted(set(allowed_ids))
+        allowed = set(allowed_order)
+        local_map = {i + 1: aid for i, aid in enumerate(allowed_order)}
+        valid_rows = [a for a in (rows or []) if isinstance(a, dict)]
+        for a in valid_rows:
+            iid = None
+            candidate_id = None
+            try:
+                candidate_id = int(a.get("id"))
+                if candidate_id in allowed:
+                    iid = candidate_id
+            except Exception:
+                pass
+            # Recovery batches are sometimes renumbered 1..N by compact models.
+            if iid is None and allow_local_renumber and candidate_id in local_map:
+                iid = local_map[candidate_id]
+            if iid is None and force_single_id is not None and len(valid_rows) == 1:
+                iid = force_single_id
+            if iid is None or iid not in allowed:
+                continue
+            row = dict(a)
+            row["id"] = iid
+            by_id[iid] = row
+
     for model in models:
         try:
-            first = call_model(model, docs, 2200)
             by_id = {}
-            for a in first:
-                try:
-                    iid = int(a.get("id"))
-                except Exception:
-                    continue
-                if iid in expected_ids:
-                    by_id[iid] = a
+            # First attempt: all 15 candidates. A partial response is useful and is
+            # completed below instead of being accepted as-is.
+            first = call_model(model, docs, 2400)
+            absorb_geo(first, by_id, expected_ids)
 
+            # V11: recover omitted candidates in chunks of three. Crucially, local
+            # ids 1..N are mapped back to the original candidate ids. This fixes the
+            # 11/15 pattern seen when a recovery request for ids such as 12..15 was
+            # answered as ids 1..4 and then discarded by V10.
             missing_ids = sorted(expected_ids - set(by_id))
-            if missing_ids:
-                missing_docs = [d for d in docs if int(d["id"]) in missing_ids]
-                # Recovery request only for omitted items; compact enough for free tier.
+            for offset in range(0, len(missing_ids), 3):
+                chunk_ids = missing_ids[offset:offset + 3]
+                missing_docs = [d for d in docs if int(d["id"]) in chunk_ids]
+                if not missing_docs:
+                    continue
                 try:
-                    recovered = call_model(model, missing_docs, max(900, 260 * len(missing_docs)))
-                    for a in recovered:
-                        try:
-                            iid = int(a.get("id"))
-                        except Exception:
-                            continue
-                        if iid in expected_ids:
-                            by_id[iid] = a
+                    recovered = call_model(model, missing_docs, max(850, 300 * len(missing_docs)))
+                    absorb_geo(recovered, by_id, chunk_ids, allow_local_renumber=True)
                 except Exception as recovery_exc:
-                    all_errors.append(f"recovery {model}: {recovery_exc}")
+                    all_errors.append(f"recovery {model} {chunk_ids}: {recovery_exc}")
+
+            # Final one-item recovery: one valid object is safely assigned to the
+            # requested original id even if the model emits id=1.
+            still_missing = sorted(expected_ids - set(by_id))
+            for iid in still_missing:
+                one_doc = [d for d in docs if int(d["id"]) == iid]
+                if not one_doc:
+                    continue
+                try:
+                    recovered = call_model(model, one_doc, 650)
+                    absorb_geo(recovered, by_id, {iid}, allow_local_renumber=True, force_single_id=iid)
+                except Exception as recovery_exc:
+                    all_errors.append(f"single recovery {model} {iid}: {recovery_exc}")
 
             clean = [by_id[i] for i in sorted(by_id)]
             if clean:
                 clean, _scale_fixed = _normalize_geo_ai_metric_scale(clean)
-                # V7 semantic quality gate: normalize accidental 0-10 scoring first,
-                # then evaluate whether the response contains meaningful signals.
-                # V6 showed that a model can return all
-                # requested IDs yet classify every geopolitical headline as zero/neutral.
-                # That is structurally valid but analytically useless. In that case
-                # try the independent fallback model instead of silently scoring 50.
                 signal_count = 0
                 for a in clean:
                     try:
@@ -3101,7 +3159,7 @@ There must be exactly one object for every supplied id."""
             all_errors.append(str(exc))
             continue
 
-    raise RuntimeError(" | ".join(all_errors)[-1100:])
+    raise RuntimeError(" | ".join(all_errors)[-1400:])
 
 
 def _normalize_geo_ai_metric_scale(analyses):
@@ -3593,7 +3651,7 @@ def calculate_rates_engine(markets):
 
 
 def calculate_geo_gold_transmission(geopolitical, markets):
-    """V10: separate geopolitical RISK from gold DIRECTION.
+    """V11: separate geopolitical RISK from gold DIRECTION.
 
     The AI is allowed to identify only a plausible transmission PATHWAY for each
     geopolitical event. It is NOT allowed to call the event bullish/bearish for
@@ -4089,7 +4147,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitics V9 separates Global Risk Level from Gold Transmission. AI clusters duplicate worldwide events and measures escalation momentum; only the live transmission through USD, Treasury yields, oil/inflation and VIX enters the Gold Intelligence Score. High geopolitical risk is not assumed to be bullish for gold.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitics V11 separates Global Risk Level from Gold Transmission and performs missing-item recovery before scoring. AI clusters duplicate worldwide events and measures escalation momentum; only the live transmission through USD, Treasury yields, oil/inflation and VIX enters the Gold Intelligence Score. High geopolitical risk is not assumed to be bullish for gold.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
