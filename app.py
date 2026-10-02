@@ -3089,7 +3089,53 @@ def _normalize_geo_ai_metric_scale(analyses):
     return normalized, True
 
 
+def _geo_cluster_tokens(text):
+    """Compact semantic tokens used only for duplicate-event clustering."""
+    t = normalize_text(text or "")
+    words = re.findall(r"[a-z0-9\u0600-\u06ff]+", t)
+    stop = {
+        "the","a","an","and","or","to","of","in","on","for","with","as","at","by","from",
+        "says","said","new","latest","report","reports","amid","after","over","into","more",
+        "us","u","s","united","states",
+        "و","در","به","از","با","برای","که","این","آن","بر","یک","شد","کرد","می",
+    }
+    return {w for w in words if len(w) > 2 and w not in stop}
+
+
+def _geo_cluster_match(group, key, analysis):
+    old_key = group.get("key", "")
+    if key and old_key:
+        ratio = SequenceMatcher(None, key, old_key).ratio()
+        if ratio >= 0.66:
+            return True
+
+    rep = group.get("analysis") or {}
+    if str(rep.get("category") or "").upper() != str(analysis.get("category") or "").upper():
+        return False
+    if str(rep.get("direction") or "").upper() != str(analysis.get("direction") or "").upper():
+        return False
+
+    region_a = _geo_cluster_tokens(rep.get("region") or "")
+    region_b = _geo_cluster_tokens(analysis.get("region") or "")
+    if region_a and region_b and not (region_a & region_b):
+        return False
+
+    tokens_a = _geo_cluster_tokens((rep.get("event_key") or "") + " " + (rep.get("summary") or ""))
+    tokens_b = _geo_cluster_tokens((analysis.get("event_key") or "") + " " + (analysis.get("summary") or ""))
+    if not tokens_a or not tokens_b:
+        return False
+    jaccard = len(tokens_a & tokens_b) / max(1, len(tokens_a | tokens_b))
+    return jaccard >= 0.30
+
+
 def _score_geopolitical_events(candidates, analyses):
+    """V8: score GLOBAL RISK itself, not the direction of gold.
+
+    The previous engine used escalating events as automatically positive for gold.
+    V8 separates:
+      1) Global Geopolitical Risk Level / escalation momentum
+      2) Gold Transmission, calculated later from live USD/yields/oil/VIX channels.
+    """
     by_id = {i+1: c for i, c in enumerate(candidates)}
     stage_mult = {
         "STATEMENT":0.30, "THREAT":0.48, "PREPARATION":0.68,
@@ -3111,6 +3157,7 @@ def _score_geopolitical_events(candidates, analyses):
             continue
         if iid not in by_id:
             continue
+
         flag = a.get("material", False)
         if isinstance(flag, str):
             flag = flag.strip().lower() in ("true","1","yes")
@@ -3126,12 +3173,10 @@ def _score_geopolitical_events(candidates, analyses):
             market_rel = clamp(float(a.get("market_relevance", 0)))
         except Exception:
             market_rel = 0
+
         direction = str(a.get("direction") or "NEUTRAL").upper()
         stage = str(a.get("stage") or "STATEMENT").upper()
 
-        # V6 semantic floor: use the model's graded meaning, not only its Boolean.
-        # rescue an item even if its boolean material flag is over-conservative.
-        # This is still semantic scoring, not keyword scoring.
         semantic_floor = (
             direction in ("ESCALATION", "DE_ESCALATION")
             and sev >= 15
@@ -3146,30 +3191,29 @@ def _score_geopolitical_events(candidates, analyses):
         )
         if not (flag or semantic_floor or concrete_action_floor):
             continue
-        if rel < 10:
-            continue
+
         a = dict(a)
         a["rescued_by_semantic_floor"] = bool((semantic_floor or concrete_action_floor) and not flag)
         material.append((iid, by_id[iid], a))
 
-    # Cluster duplicate coverage semantically using the AI's stable event_key.
+    # Stronger event clustering: event_key similarity plus region/category/token overlap.
     groups = []
     for iid, src, a in material:
         key = normalize_text(str(a.get("event_key") or a.get("summary") or ""))[:220]
         matched = None
         for g in groups:
-            old = g["key"]
-            ratio = SequenceMatcher(None, key, old).ratio() if key and old else 0
-            if key == old or ratio >= 0.74:
+            if _geo_cluster_match(g, key, a):
                 matched = g
                 break
         if matched is None:
-            matched = {"key": key, "members": []}
+            matched = {"key": key, "analysis": a, "members": []}
             groups.append(matched)
         matched["members"].append((iid, src, a))
 
     events = []
-    net = 0.0
+    raw_risk_pressure = 0.0
+    raw_momentum = 0.0
+
     for g in groups:
         members = g["members"]
         if not members:
@@ -3177,15 +3221,15 @@ def _score_geopolitical_events(candidates, analyses):
 
         def member_weight(m):
             _, src, a = m
-            try: conf = clamp(float(a.get("confidence",50))) / 100.0
-            except Exception: conf = 0.5
+            try:
+                conf = clamp(float(a.get("confidence",50))) / 100.0
+            except Exception:
+                conf = 0.5
             return max(0.05, float(src.get("credibility",0.68)) * conf)
 
-        # Representative = strongest confidence/credibility member.
         rep = max(members, key=member_weight)
         _, rep_src, rep_a = rep
 
-        # Aggregate direction by evidence weight.
         dir_value = 0.0
         for _, src, a in members:
             d = str(a.get("direction") or "NEUTRAL").upper()
@@ -3198,17 +3242,20 @@ def _score_geopolitical_events(candidates, analyses):
             num = den = 0.0
             for _, src, a in members:
                 w = member_weight((0,src,a))
-                try: v = clamp(float(a.get(field, default)))
-                except Exception: v = default
-                num += v*w; den += w
+                try:
+                    v = clamp(float(a.get(field, default)))
+                except Exception:
+                    v = default
+                num += v*w
+                den += w
             return num/den if den else float(default)
 
         sev = weighted_avg("severity", 0)
         rel = weighted_avg("gold_relevance", 0)
+        market_rel = weighted_avg("market_relevance", 50)
         oil_rel = weighted_avg("oil_relevance", 0)
         conf = weighted_avg("confidence", 50)
 
-        # Choose the most advanced stage seen in duplicate coverage.
         stages = [str(a.get("stage") or "STATEMENT").upper() for _,_,a in members]
         stage = max(stages, key=lambda s: stage_rank.get(s,0))
         mult = stage_mult.get(stage,0.50)
@@ -3216,13 +3263,22 @@ def _score_geopolitical_events(candidates, analyses):
         latest = min((_geo_hours_since(src.get("date")) for _,src,_ in members), default=999)
         decay = _geo_decay(latest)
         cred = max((float(src.get("credibility",0.68)) for _,src,_ in members), default=0.68)
-        cred = min(1.0, cred + 0.025*max(0,len(members)-1))
+        # Multiple independent reports raise confidence, not event count.
+        cred = min(1.0, cred + 0.03*max(0,len(members)-1))
 
-        impact = sign * 8.0 * (sev/100) * (rel/100) * (conf/100) * mult * cred * decay
-        impact = max(-8.0, min(8.0, impact))
-        net += impact
+        # Risk pressure is about GLOBAL RISK, so it uses market relevance rather
+        # than assuming the event is directionally positive for gold.
+        risk_pressure = (
+            sign * 10.0 * (sev/100.0) * (max(20.0, market_rel)/100.0)
+            * (conf/100.0) * mult * cred * decay
+        )
+        risk_pressure = max(-10.0, min(10.0, risk_pressure))
+        raw_risk_pressure += risk_pressure
 
-        # Prefer most credible source for clickable link/date.
+        # Fresh concrete actions count more for "where the conflict is going".
+        momentum_mult = 1.15 if stage in ("PREPARATION","CONFIRMED_ACTION","ACTIVE_CONFLICT","SANCTIONS_ACTION","TRADE_ACTION","CEASEFIRE_DEAL") else 0.75
+        raw_momentum += risk_pressure * momentum_mult
+
         primary = max((src for _,src,_ in members), key=lambda x: float(x.get("credibility",0.68)))
         source_names = []
         for _, src, _ in members:
@@ -3238,46 +3294,65 @@ def _score_geopolitical_events(candidates, analyses):
             "direction": direction,
             "stage": stage,
             "severity": round(sev,0),
+            "market_relevance": round(market_rel,0),
             "gold_relevance": round(rel,0),
             "oil_relevance": round(oil_rel,0),
             "confidence": round(conf,0),
-            "impact": round(impact,2),
+            "risk_pressure": round(risk_pressure,2),
+            # Backward-compatible field; template is relabeled in V8.
+            "impact": round(risk_pressure,2),
             "source_count": len(members),
             "sources": source_names[:4],
             "link": primary.get("link"),
             "date": primary.get("date"),
         })
 
-    score = clamp(50 + net, 5, 95)
-    events.sort(key=lambda x:(abs(x.get("impact",0)),x.get("severity",0)), reverse=True)
-    if score >= 80:
-        regime = "EXTREME GLOBAL RISK — STRONG SUPPORT FOR GOLD"
-    elif score >= 65:
-        regime = "HIGH GLOBAL RISK — SUPPORTIVE FOR GOLD"
-    elif score >= 55:
-        regime = "ELEVATED GLOBAL RISK — MILD SUPPORT FOR GOLD"
-    elif score <= 35:
-        regime = "STRONG DE-ESCALATION — HEADWIND FOR GOLD"
-    elif score <= 45:
-        regime = "DE-ESCALATING — MILD HEADWIND FOR GOLD"
+    # Non-linear saturation: repeated headlines cannot push risk linearly forever.
+    # raw 0 -> 50; raw 8 -> ~62.5; raw 15 -> ~66.3; raw 30 -> ~69.7.
+    risk_delta = 25.0 * raw_risk_pressure / (15.0 + abs(raw_risk_pressure)) if raw_risk_pressure else 0.0
+    risk_level = clamp(50.0 + risk_delta, 20.0, 85.0)
+
+    # Momentum is direction-of-travel, not another risk level.
+    momentum = max(-100.0, min(100.0, raw_momentum * 5.0))
+    if momentum >= 25:
+        momentum_label = "ESCALATING"
+    elif momentum <= -25:
+        momentum_label = "DE-ESCALATING"
     else:
-        regime = "BALANCED / NEUTRAL"
+        momentum_label = "STABLE / MIXED"
+
+    events.sort(key=lambda x:(abs(x.get("risk_pressure",0)),x.get("severity",0)), reverse=True)
+    if risk_level >= 75:
+        regime = "VERY HIGH GLOBAL GEOPOLITICAL RISK"
+    elif risk_level >= 62:
+        regime = "HIGH GLOBAL GEOPOLITICAL RISK"
+    elif risk_level >= 55:
+        regime = "ELEVATED GLOBAL GEOPOLITICAL RISK"
+    elif risk_level <= 40:
+        regime = "LOW / DE-ESCALATING GLOBAL RISK"
+    else:
+        regime = "BALANCED / MODERATE GLOBAL RISK"
 
     escalating = sum(1 for e in events if e["direction"]=="ESCALATION")
     deescalating = sum(1 for e in events if e["direction"]=="DE_ESCALATION")
+
     return {
-        "score": round(score,1),
+        # score remains the risk level for backward compatibility.
+        "score": round(risk_level,1),
+        "risk_level": round(risk_level,1),
         "regime": regime,
+        "risk_momentum": round(momentum,1),
+        "momentum_label": momentum_label,
         "events": events[:GEO_MAX_EVENTS],
         "event_count": len(events),
         "escalating": escalating,
         "deescalating": deescalating,
-        "net_impact": round(net,2),
+        "net_risk_pressure": round(raw_risk_pressure,2),
+        "net_impact": round(raw_risk_pressure,2),
         "material_item_count": len(material),
         "model_material_count": sum(1 for _,_,a in material if not a.get("rescued_by_semantic_floor")),
         "rescued_material_count": sum(1 for _,_,a in material if a.get("rescued_by_semantic_floor")),
     }
-
 
 def get_geopolitical_monitor(telegram_news, utotimes_news):
     now = time.time()
@@ -3432,7 +3507,88 @@ def calculate_rates_engine(markets):
     }
 
 
-def calculate_scores(markets, fed_score, economic_score, geopolitical_score):
+
+def calculate_geo_gold_transmission(geopolitical, markets):
+    """Translate geopolitical risk into its CURRENT effect on gold.
+
+    High geopolitical risk is not automatically bullish for gold. The sign comes
+    from live cross-asset transmission:
+      USD up           -> headwind for gold
+      Treasury yields up -> headwind for gold
+      Oil up + yields up -> inflation / tighter-policy channel, headwind for gold
+      VIX up           -> risk-off / safe-haven channel, support for gold
+
+    The geopolitical risk level and escalation momentum amplify whichever channel
+    the market is actually transmitting. Gold's own price is intentionally NOT
+    used here, avoiding circular scoring.
+    """
+    risk_level = float(geopolitical.get("risk_level", geopolitical.get("score", 50.0)) or 50.0)
+    momentum = float(geopolitical.get("risk_momentum", 0.0) or 0.0)
+
+    dxy_change = float(markets.get("dxy", {}).get("change_pct") or 0.0)
+    oil_change = float(markets.get("oil", {}).get("change_pct") or 0.0)
+    vix_change = float(markets.get("vix", {}).get("change_pct") or 0.0)
+
+    rates_engine = calculate_rates_engine(markets)
+    weighted_bps = float(rates_engine.get("weighted_bps") or 0.0)
+
+    dollar_channel = max(-7.0, min(7.0, -dxy_change * 10.0))
+    rates_channel = max(-7.0, min(7.0, -weighted_bps * 0.65))
+    riskoff_channel = max(-4.0, min(4.0, vix_change * 0.12))
+
+    # Oil is not mechanically bullish for gold. When oil and yields rise together,
+    # the dominant short-run channel is often inflation -> tighter policy -> higher
+    # real/nominal yields, which can pressure gold.
+    if oil_change > 0 and weighted_bps > 0:
+        oil_channel = -min(6.0, oil_change * 0.75 + weighted_bps * 0.22)
+        oil_regime = "INFLATION / TIGHTENING CHANNEL"
+    elif oil_change > 0 and weighted_bps <= 0:
+        oil_channel = min(1.5, oil_change * 0.12)
+        oil_regime = "INFLATION-HEDGE / MIXED"
+    else:
+        oil_channel = 0.0
+        oil_regime = "NO OIL INFLATION PENALTY"
+
+    raw_channel = dollar_channel + rates_channel + riskoff_channel + oil_channel
+
+    # High risk / strong escalation does not pick the sign; it amplifies the sign
+    # already visible in cross-assets.
+    intensity = 1.0
+    if risk_level > 50:
+        intensity += min(0.35, (risk_level - 50.0) / 70.0)
+    intensity += min(0.20, abs(momentum) / 500.0)
+
+    delta = raw_channel * intensity
+    score = clamp(50.0 + delta, 20.0, 80.0)
+
+    if score >= 58:
+        regime = "GEOPOLITICS TRANSMITTING BULLISHLY TO GOLD"
+    elif score <= 42:
+        regime = "GEOPOLITICS TRANSMITTING BEARISHLY TO GOLD"
+    elif score >= 53:
+        regime = "MILDLY SUPPORTIVE FOR GOLD"
+    elif score <= 47:
+        regime = "MILD HEADWIND FOR GOLD"
+    else:
+        regime = "MIXED / NEUTRAL GOLD TRANSMISSION"
+
+    return {
+        "score": round(score, 1),
+        "regime": regime,
+        "raw_channel": round(raw_channel, 2),
+        "intensity": round(intensity, 2),
+        "dollar_channel": round(dollar_channel, 2),
+        "rates_channel": round(rates_channel, 2),
+        "oil_channel": round(oil_channel, 2),
+        "riskoff_channel": round(riskoff_channel, 2),
+        "oil_regime": oil_regime,
+        "dxy_change": round(dxy_change, 3),
+        "weighted_bps": round(weighted_bps, 2),
+        "oil_change": round(oil_change, 3),
+        "vix_change": round(vix_change, 3),
+    }
+
+def calculate_scores(markets, fed_score, economic_score, geopolitical_gold_score):
     gold_change = markets["gold"].get("change_pct") or 0
     dxy_change = markets["dxy"].get("change_pct") or 0
     oil_change = markets["oil"].get("change_pct") or 0
@@ -3452,7 +3608,7 @@ def calculate_scores(markets, fed_score, economic_score, geopolitical_score):
         "Federal Reserve": round(fed_score, 1),
         "Rates": round(rates_score, 1),
         "US Dollar": round(dollar_score, 1),
-        "Geopolitical Risk": round(geopolitical_score, 1),
+        "Geopolitical Gold Impact": round(geopolitical_gold_score, 1),
         "Oil / Inflation": round(oil_score, 1),
         "Market Flow": round(market_flow_score, 1),
         "Technical": round(technical_score, 1),
@@ -3463,7 +3619,7 @@ def calculate_scores(markets, fed_score, economic_score, geopolitical_score):
         "Federal Reserve": 0.20,
         "Rates": 0.15,
         "US Dollar": 0.15,
-        "Geopolitical Risk": 0.10,
+        "Geopolitical Gold Impact": 0.10,
         "Oil / Inflation": 0.07,
         "Market Flow": 0.05,
         "Technical": 0.08,
@@ -3521,7 +3677,12 @@ def build_dashboard_data():
     )
     economic = get_economic_monitor(two_year_confirmation_bps)
     geopolitical = get_geopolitical_monitor(telegram_news, utotimes_news)
-    score, bias, components, rates_engine = calculate_scores(markets, fed["score"], economic["score"], geopolitical["score"])
+    geo_gold = calculate_geo_gold_transmission(geopolitical, markets)
+    geopolitical = dict(geopolitical)
+    geopolitical["gold_transmission"] = geo_gold
+    geopolitical["gold_transmission_score"] = geo_gold["score"]
+    geopolitical["gold_transmission_regime"] = geo_gold["regime"]
+    score, bias, components, rates_engine = calculate_scores(markets, fed["score"], economic["score"], geo_gold["score"])
     data = {
         "score": score, "bias": bias, "components": components, "markets": markets,
         "rates": rates_engine, "economic": economic, "fed": fed, "geopolitical": geopolitical, "telegram_news": telegram_news[:8],
@@ -3553,7 +3714,7 @@ def _initial_dashboard_data():
         "Federal Reserve": 50.0,
         "Rates": 50.0,
         "US Dollar": 50.0,
-        "Geopolitical Risk": 50.0,
+        "Geopolitical Gold Impact": 50.0,
         "Oil / Inflation": 50.0,
         "Market Flow": 50.0,
         "Technical": 50.0,
@@ -3575,7 +3736,7 @@ def _initial_dashboard_data():
             "events": [], "event_count": 0,
         },
         "fed": {"score": 50.0, "events": [], "event_count": 0, "average_stance": 0.0, "mode": "AI SEMANTIC", "model": GROQ_MODEL, "status": "INITIALIZING"},
-        "geopolitical": {"score": 50.0, "regime": "INITIALIZING", "events": [], "event_count": 0, "escalating": 0, "deescalating": 0, "net_impact": 0.0, "status": "INITIALIZING", "source_stats": {}},
+        "geopolitical": {"score": 50.0, "risk_level": 50.0, "regime": "INITIALIZING", "risk_momentum": 0.0, "momentum_label": "INITIALIZING", "gold_transmission_score": 50.0, "gold_transmission_regime": "INITIALIZING", "gold_transmission": {"score":50.0,"regime":"INITIALIZING","dollar_channel":0.0,"rates_channel":0.0,"oil_channel":0.0,"riskoff_channel":0.0,"raw_channel":0.0,"intensity":1.0}, "events": [], "event_count": 0, "escalating": 0, "deescalating": 0, "net_impact": 0.0, "status": "INITIALIZING", "source_stats": {}},
         "telegram_news": [], "utotimes_news": [],
         "updated": "Waiting for first data refresh…",
         "initializing": True,
@@ -3690,15 +3851,20 @@ def dashboard():
 
 <div class="section-title">Global Geopolitical Risk Monitor</div>
 <div class="components">
-<div class="component"><div class="component-name">Geopolitical Score</div><div class="component-score">{{ data.geopolitical.score }} <span style="font-size:14px;color:#697282">/100</span></div></div>
+<div class="component"><div class="component-name">Global Risk Level</div><div class="component-score">{{ data.geopolitical.risk_level|default(data.geopolitical.score) }} <span style="font-size:14px;color:#697282">/100</span></div></div>
+<div class="component"><div class="component-name">Geo Gold Transmission</div><div class="component-score">{{ data.geopolitical.gold_transmission_score|default(50) }} <span style="font-size:14px;color:#697282">/100</span></div></div>
+<div class="component"><div class="component-name">Risk Momentum</div><div class="component-score">{{ data.geopolitical.risk_momentum|default(0) }}</div><div class="note">{{ data.geopolitical.momentum_label|default("MIXED") }}</div></div>
 <div class="component"><div class="component-name">Active Events</div><div class="component-score">{{ data.geopolitical.event_count }}</div></div>
 <div class="component"><div class="component-name">Escalating</div><div class="component-score">{{ data.geopolitical.escalating }}</div></div>
 <div class="component"><div class="component-name">De-escalating</div><div class="component-score">{{ data.geopolitical.deescalating }}</div></div>
-<div class="component"><div class="component-name">Net Gold Impact</div><div class="component-score">{% if data.geopolitical.net_impact>0 %}+{% endif %}{{ data.geopolitical.net_impact }}</div></div>
 </div>
 <div class="panel" style="margin-top:12px;margin-bottom:12px">
 <div class="news-title">{{ data.geopolitical.regime }}</div>
+<div class="note" style="margin-top:5px"><strong>{{ data.geopolitical.gold_transmission_regime|default("Gold transmission pending") }}</strong></div>
 <div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong>{% if data.geopolitical.ai_scale_normalized %} • Score scale: <strong>normalized 0-10 → 0-100</strong>{% endif %}</div>
+{% if data.geopolitical.gold_transmission %}
+<div class="note">Gold transmission channels: USD <strong class="{% if data.geopolitical.gold_transmission.dollar_channel>0 %}positive{% elif data.geopolitical.gold_transmission.dollar_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.dollar_channel }}</strong> • Rates <strong class="{% if data.geopolitical.gold_transmission.rates_channel>0 %}positive{% elif data.geopolitical.gold_transmission.rates_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.rates_channel }}</strong> • Oil/Inflation <strong class="{% if data.geopolitical.gold_transmission.oil_channel>0 %}positive{% elif data.geopolitical.gold_transmission.oil_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.oil_channel }}</strong> • Risk-off/VIX <strong class="{% if data.geopolitical.gold_transmission.riskoff_channel>0 %}positive{% elif data.geopolitical.gold_transmission.riskoff_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.riskoff_channel }}</strong> • Risk amplifier ×{{ data.geopolitical.gold_transmission.intensity }}</div>
+{% endif %}
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
 {% if data.geopolitical.event_count == 0 and data.geopolitical.candidate_diagnostics %}
 <details style="margin-top:10px"><summary class="note" style="cursor:pointer">Show Geo candidate diagnostics</summary>
@@ -3714,7 +3880,7 @@ def dashboard():
 <div class="fed-top"><div class="speaker">{{ event.region }}</div><div class="badge">{{ event.category }}</div></div>
 {% set geoclass='tone-hawkish' if event.direction=='ESCALATION' else ('tone-dovish' if event.direction=='DE_ESCALATION' else '') %}
 <div class="tone {{ geoclass }}">{{ event.direction }} • {{ event.stage }}</div>
-<div class="impact">Severity: {{ event.severity }}/100 • Gold relevance: {{ event.gold_relevance }}/100 • Confidence: {{ event.confidence }}% • Gold impact: {% if event.impact>0 %}+{% endif %}{{ event.impact }}</div>
+<div class="impact">Severity: {{ event.severity }}/100 • Gold relevance: {{ event.gold_relevance }}/100 • Confidence: {{ event.confidence }}% • Risk pressure: {% if event.risk_pressure|default(event.impact)>0 %}+{% endif %}{{ event.risk_pressure|default(event.impact) }}</div>
 <div class="event-title" style="margin-top:8px">{{ event.summary }}</div>
 <div class="note" style="margin-top:8px">Sources: {{ event.source_count }} • {% for s in event.sources %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
 <div class="news-meta">{{ event.date or '' }}</div>
@@ -3754,7 +3920,7 @@ Federal Reserve Score: <strong>{{ data.fed.score }}/100</strong>
 
 <div class="section-title">Live News Monitor</div><div class="news-grid"><div class="panel"><div class="news-title">UtoFX Telegram</div>{% if data.telegram_news %}{% for news in data.telegram_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.text }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">Telegram feed temporarily unavailable.</div>{% endif %}</div><div class="panel"><div class="news-title">UtoTimes</div>{% if data.utotimes_news %}{% for news in data.utotimes_news %}<div class="news-item">{% if news.link %}<a href="{{ news.link }}" target="_blank">{% endif %}<div class="news-text">{{ news.title }}</div><div class="news-meta">{{ news.date or '' }}</div>{% if news.link %}</a>{% endif %}</div>{% endfor %}{% else %}<div class="note">UtoTimes feed temporarily unavailable.</div>{% endif %}</div></div>
 
-<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitical Score is global: GDELT + Google News worldwide radar + Trump Truth/X direct statements + Uto secondary reporting. AI clusters duplicate coverage into one event, separates statements/threats from confirmed actions, and applies recency decay.</div></div>
+<div class="status">SYSTEM STATUS: <span class="online">{% if data.initializing %}INITIALIZING{% elif data.refreshing %}REFRESHING{% else %}ONLINE{% endif %}</span><div class="note">Last calculation: {{ data.updated }}</div><div class="note">Market refresh: 30 seconds • Fed/Economic/Geopolitical refresh: 5 minutes</div><div class="note">Rates Engine uses official U.S. Treasury nominal CMT yields and basis-point moves: 2Y 50% / 10Y 35% / 30Y 15%. FRED Daily is the fallback. These are latest official daily closes; intraday 2Y confirmation is disabled when only daily data is available.</div><div class="note">Fed Score uses official Federal Reserve System sources as primary and UtoFX/UtoTimes as secondary same-day sources. Official sources win when they overlap. AI compares the latest official/Uto documents speaker-by-speaker and returns one semantic stance per member; keyword repetition does not score hawkishness/dovishness.</div><div class="note">Economic Actuals are isolated by exact UtoTimes event section; Forex Factory is used only as exact-title backup. Explicit revisions are scored separately.</div><div class="note">Geopolitics V8 separates Global Risk Level from Gold Transmission. AI clusters duplicate worldwide events and measures escalation momentum; only the live transmission through USD, Treasury yields, oil/inflation and VIX enters the Gold Intelligence Score. High geopolitical risk is not assumed to be bullish for gold.</div></div>
 </div><script>setTimeout(function(){window.location.reload();}, {{ 5000 if data.initializing or data.refreshing else 30000 }});</script></body></html>
 '''
     return render_template_string(html, data=data)
