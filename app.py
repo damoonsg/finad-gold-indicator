@@ -2837,11 +2837,12 @@ def _geo_fingerprint(items):
 
 
 def _groq_geopolitical_analysis(candidates):
-    """Classify every candidate, then let Python cluster duplicate events.
+    """Analyze each geopolitical candidate semantically and recover missing IDs.
 
-    Requiring one AI record per input prevents the whole geopolitical monitor
-    from silently returning an empty event list when one broad synthesis prompt
-    is overly conservative.
+    V5 keeps one semantic record per input item. If the first Groq response is
+    incomplete, a second compact request is sent only for the missing IDs. This
+    avoids silently treating omitted items as non-material while staying inside
+    the free-tier token budget.
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -2856,38 +2857,30 @@ def _groq_geopolitical_analysis(candidates):
             "source_type": c.get("source_type"),
             "topic": c.get("topic", "OTHER"),
             "credibility": round(float(c.get("credibility", 0.68)), 2),
-            "headline_or_text": (c.get("text") or "")[:520],
+            "headline_or_text": (c.get("text") or "")[:650],
         })
 
     system_prompt = """You are a global geopolitical-risk analyst for a GOLD macro dashboard.
-Analyze EACH supplied item by meaning, not keyword counts. Return exactly one analysis object for every supplied id.
+Analyze EACH supplied item by meaning and current policy/security significance, never by keyword counts. Return one analysis object for every supplied id.
 
-An item is material=true when it reports a current development that can plausibly affect gold, USD, rates, oil, shipping, or global risk appetite: military escalation/de-escalation, troop deployments, strikes, nuclear threats/actions, sanctions, ceasefires/peace moves, shipping chokepoints, major terrorism/security events, major coups/instability, or materially new trade/tariff/export-control action.
+Materiality rule:
+- material=true for a CURRENT development with plausible non-trivial impact on gold, USD, rates, oil, shipping, sanctions risk, trade risk, or global risk appetite.
+- Ongoing conflicts still count when the item reports a new strike, deployment, warning, sanctions action, ceasefire move, negotiation development, blockade/shipping disruption, nuclear development, major tariff/export-control action, or other concrete change.
+- Do NOT require an event to be catastrophic or instantly market-moving.
+- A high-level official statement can be material as STATEMENT or THREAT even if action is not yet confirmed.
+- A Trump X/Truth post proves what was said, not that the threatened action occurred.
+- Distinguish STATEMENT/THREAT from PREPARATION, CONFIRMED_ACTION, and ACTIVE_CONFLICT.
+- DE_ESCALATION includes credible ceasefire, withdrawal, sanctions relief, substantive negotiations, or peace agreement.
+- Routine domestic politics, ordinary crime, opinion pieces without a fresh development, and historical background are material=false.
 
-Important:
-- Do not require an event to be catastrophic. A verified troop deployment, nuclear warning, new sanctions package, ceasefire move, or major tariff action can be material.
-- A politician's X/Truth post proves the statement, not that the threatened action happened.
-- Distinguish STATEMENT/THREAT from PREPARATION and CONFIRMED_ACTION/ACTIVE_CONFLICT.
-- DE_ESCALATION includes credible ceasefire, withdrawal, sanctions relief, or substantive peace negotiations.
-- Routine domestic politics, ordinary crime, commentary, and historical background are material=false.
-- Use a stable event_key so separate headlines about the same real-world event get similar labels.
-- Do not invent facts beyond the supplied item.
+Even when material=false, still fill direction, stage, severity, gold_relevance, oil_relevance, and confidence using your best semantic judgment. Use NEUTRAL only when the item genuinely carries no escalation/de-escalation signal.
+Use a stable event_key so separate headlines about the same real-world event receive similar labels. Do not invent facts beyond the supplied item.
 
 Return ONLY valid JSON:
 {"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":0,"gold_relevance":0,"oil_relevance":0,"confidence":0}]}.
+There must be exactly one object for every supplied id."""
 
-There must be one object for every supplied id, even when material=false."""
-
-    base_payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps({"items": docs}, ensure_ascii=False)},
-        ],
-        "temperature": 0.05,
-        "max_tokens": 1800,
-    }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
     models = []
     for model in (GEO_GROQ_MODEL, GEO_GROQ_FALLBACK_MODEL):
         if model and model not in models and model != GROQ_MODEL:
@@ -2895,58 +2888,89 @@ There must be one object for every supplied id, even when material=false."""
     if not models:
         models = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
-    errors = []
-    expected = len(docs)
-    for model in models:
+    def call_model(model, batch_docs, max_tokens):
+        base_payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps({"items": batch_docs}, ensure_ascii=False)},
+            ],
+            "temperature": 0.05,
+            "max_tokens": max_tokens,
+        }
+        if model.startswith("openai/gpt-oss-"):
+            base_payload["reasoning_effort"] = "low"
+
+        errors = []
         for use_json_mode in (True, False):
             payload = dict(base_payload)
-            payload["model"] = model
-            if model.startswith("openai/gpt-oss-"):
-                payload["reasoning_effort"] = "low"
             if use_json_mode:
                 payload["response_format"] = {"type": "json_object"}
             try:
-                r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 28))
+                r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 30))
                 if r.status_code == 429:
                     retry_after = r.headers.get("retry-after", "unknown")
-                    errors.append(f"GROQ RATE LIMIT on {model} (retry-after {retry_after}s)")
-                    break
+                    raise RuntimeError(f"GROQ RATE LIMIT on {model} (retry-after {retry_after}s)")
                 if r.status_code >= 400:
                     detail = (r.text or "").replace("\n", " ")[:420]
-                    errors.append(f"GROQ HTTP {r.status_code} on {model}: {detail}")
                     if r.status_code == 400 and use_json_mode:
+                        errors.append(f"GROQ HTTP 400 on {model}: {detail}")
                         continue
-                    break
-
+                    raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
                 parsed = _parse_json_object(r.json()["choices"][0]["message"]["content"])
                 analyses = parsed.get("analyses")
                 if not isinstance(analyses, list):
                     raise ValueError("Geo AI response missing analyses array")
-
-                # Keep only valid ids and de-duplicate by id.
-                by_id = {}
-                for a in analyses:
-                    try:
-                        iid = int(a.get("id"))
-                    except Exception:
-                        continue
-                    if 1 <= iid <= expected:
-                        by_id[iid] = a
-                clean = [by_id[i] for i in sorted(by_id)]
-
-                # A severely incomplete response is not accepted; try the other model.
-                if expected and len(clean) < max(3, int(expected * 0.70)):
-                    errors.append(f"Incomplete Geo AI response on {model}: {len(clean)}/{expected}")
-                    break
-
-                return clean, model
+                return analyses
             except Exception as exc:
                 errors.append(str(exc))
                 if use_json_mode:
                     continue
-                break
+                raise RuntimeError(" | ".join(errors)[-900:])
+        raise RuntimeError(" | ".join(errors)[-900:])
 
-    raise RuntimeError(" | ".join(errors)[-1100:])
+    all_errors = []
+    expected_ids = {int(d["id"]) for d in docs}
+
+    for model in models:
+        try:
+            first = call_model(model, docs, 2200)
+            by_id = {}
+            for a in first:
+                try:
+                    iid = int(a.get("id"))
+                except Exception:
+                    continue
+                if iid in expected_ids:
+                    by_id[iid] = a
+
+            missing_ids = sorted(expected_ids - set(by_id))
+            if missing_ids:
+                missing_docs = [d for d in docs if int(d["id"]) in missing_ids]
+                # Recovery request only for omitted items; compact enough for free tier.
+                try:
+                    recovered = call_model(model, missing_docs, max(900, 260 * len(missing_docs)))
+                    for a in recovered:
+                        try:
+                            iid = int(a.get("id"))
+                        except Exception:
+                            continue
+                        if iid in expected_ids:
+                            by_id[iid] = a
+                except Exception as recovery_exc:
+                    all_errors.append(f"recovery {model}: {recovery_exc}")
+
+            clean = [by_id[i] for i in sorted(by_id)]
+            # Accept a useful partial result after recovery; diagnostics expose any missing IDs.
+            if clean:
+                return clean, model
+            all_errors.append(f"No valid Geo analyses returned by {model}")
+        except Exception as exc:
+            all_errors.append(str(exc))
+            continue
+
+    raise RuntimeError(" | ".join(all_errors)[-1100:])
+
 
 def _score_geopolitical_events(candidates, analyses):
     by_id = {i+1: c for i, c in enumerate(candidates)}
@@ -2973,15 +2997,38 @@ def _score_geopolitical_events(candidates, analyses):
         flag = a.get("material", False)
         if isinstance(flag, str):
             flag = flag.strip().lower() in ("true","1","yes")
-        if not flag:
-            continue
         try:
             rel = clamp(float(a.get("gold_relevance", 0)))
         except Exception:
             rel = 0
-        # Keep moderately relevant events; scoring later controls their magnitude.
-        if rel < 12:
+        try:
+            sev = clamp(float(a.get("severity", 0)))
+        except Exception:
+            sev = 0
+        direction = str(a.get("direction") or "NEUTRAL").upper()
+        stage = str(a.get("stage") or "STATEMENT").upper()
+
+        # V5 semantic floor: the model's structured severity/relevance/direction can
+        # rescue an item even if its boolean material flag is over-conservative.
+        # This is still semantic scoring, not keyword scoring.
+        semantic_floor = (
+            direction in ("ESCALATION", "DE_ESCALATION")
+            and sev >= 22
+            and rel >= 18
+        )
+        concrete_action_floor = (
+            stage in ("PREPARATION", "CONFIRMED_ACTION", "ACTIVE_CONFLICT",
+                      "CEASEFIRE_DEAL", "SANCTIONS_ACTION", "TRADE_ACTION",
+                      "DIPLOMATIC_ACTION")
+            and rel >= 15
+            and sev >= 18
+        )
+        if not (flag or semantic_floor or concrete_action_floor):
             continue
+        if rel < 10:
+            continue
+        a = dict(a)
+        a["rescued_by_semantic_floor"] = bool((semantic_floor or concrete_action_floor) and not flag)
         material.append((iid, by_id[iid], a))
 
     # Cluster duplicate coverage semantically using the AI's stable event_key.
@@ -3106,6 +3153,8 @@ def _score_geopolitical_events(candidates, analyses):
         "deescalating": deescalating,
         "net_impact": round(net,2),
         "material_item_count": len(material),
+        "model_material_count": sum(1 for _,_,a in material if not a.get("rescued_by_semantic_floor")),
+        "rescued_material_count": sum(1 for _,_,a in material if a.get("rescued_by_semantic_floor")),
     }
 
 
@@ -3161,6 +3210,7 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
         result["source_stats"] = source_stats
         result["candidate_count"] = len(candidates)
         result["ai_analysis_count"] = len(analyses)
+        result["ai_missing_count"] = max(0, len(candidates) - len(analyses))
         GEO_AI_CACHE.update({"fingerprint":fingerprint,"result":result,"time":now})
     except Exception as exc:
         previous = GEO_AI_CACHE.get("result")
@@ -3505,7 +3555,7 @@ def dashboard():
 </div>
 <div class="panel" style="margin-top:12px;margin-bottom:12px">
 <div class="news-title">{{ data.geopolitical.regime }}</div>
-<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong></div>
+<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong></div>
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
 </div>
 <div class="fed-grid">
