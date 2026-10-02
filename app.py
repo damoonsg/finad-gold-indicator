@@ -2914,7 +2914,7 @@ def _select_geo_candidates(items, limit=GEO_MAX_CANDIDATES):
 
 
 def _geo_fingerprint(items):
-    payload = [{"text":x.get("text"),"date":x.get("date"),"source":x.get("source")} for x in items]
+    payload = [{"version":"V10","text":x.get("text"),"date":x.get("date"),"source":x.get("source")} for x in items]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -2957,16 +2957,16 @@ Materiality rule:
 
 Even when material=false, still fill direction, stage, severity, gold_relevance, oil_relevance, and confidence using your best semantic judgment. Use NEUTRAL only when the item genuinely carries no escalation/de-escalation signal.
 
-Also classify the PLAUSIBLE GOLD TRANSMISSION CHANNEL of the geopolitical development itself. This is NOT a prediction of gold and must NOT use generic "war = gold up" logic:
-- SAFE_HAVEN: acute fear/risk-off demand could support gold.
-- OIL_INFLATION_RATES: energy/shipping disruption could lift oil/inflation/rate expectations and pressure gold.
-- USD_LIQUIDITY: dollar/liquidity demand could pressure gold.
-- TRADE_INFLATION: tariffs/export controls could lift inflation/rates and pressure gold.
-- SANCTIONS_FINANCIAL: sanctions/financial fragmentation may have mixed or directional gold effects depending on the item.
-- MIXED: credible bullish and bearish gold channels coexist.
-- NONE: no plausible direct transmission channel.
+Also classify ONLY the PLAUSIBLE TRANSMISSION PATHWAY of the geopolitical development. This is NOT a gold-direction prediction. NEVER label a geopolitical event bullish or bearish for gold by itself and NEVER use generic "war = gold up" logic. Direction is determined later only if live cross-assets confirm the pathway.
+- SAFE_HAVEN: acute fear/risk-off demand is a possible pathway, but its gold direction remains UNCONFIRMED until VIX/rates confirm.
+- OIL_INFLATION_RATES: energy/shipping disruption may transmit through oil, inflation and yields.
+- USD_LIQUIDITY: stress may transmit through dollar/liquidity demand.
+- TRADE_INFLATION: tariffs/export controls may transmit through inflation/yields.
+- SANCTIONS_FINANCIAL: sanctions/financial fragmentation can transmit through several competing channels.
+- MIXED: more than one plausible pathway exists.
+- NONE: no plausible direct transmission pathway.
 
-gold_channel_direction must be BULLISH_GOLD, BEARISH_GOLD, MIXED, or UNCERTAIN. This describes the event's plausible mechanism only; live market confirmation is handled separately in code. Never infer causality from market moves because no market prices are supplied here.
+Do NOT output BULLISH_GOLD or BEARISH_GOLD for an individual event. The event-level direction must remain UNCONFIRMED because the model has no live market prices. Never infer causality from market moves because no market prices are supplied here.
 Use a stable event_key so separate headlines about the same real-world event receive similar labels. Do not invent facts beyond the supplied item.
 
 Calibration examples (generic, not facts about the current feed):
@@ -2979,7 +2979,7 @@ Calibration examples (generic, not facts about the current feed):
 - CRITICAL SCALE RULE: severity, market_relevance, gold_relevance, oil_relevance, gold_channel_strength, transmission_confidence, and confidence MUST each be scored on a 0-100 scale. NEVER use a 0-10 scale. Example: high severity is 75, not 7.5 or 8.
 
 Return ONLY valid JSON:
-{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"gold_channel":"SAFE_HAVEN|OIL_INFLATION_RATES|USD_LIQUIDITY|TRADE_INFLATION|SANCTIONS_FINANCIAL|MIXED|NONE","gold_channel_direction":"BULLISH_GOLD|BEARISH_GOLD|MIXED|UNCERTAIN","gold_channel_strength":65,"transmission_confidence":75,"confidence":85}]}.
+{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"gold_channel":"SAFE_HAVEN|OIL_INFLATION_RATES|USD_LIQUIDITY|TRADE_INFLATION|SANCTIONS_FINANCIAL|MIXED|NONE","gold_channel_strength":65,"transmission_confidence":75,"confidence":85}]}.
 There must be exactly one object for every supplied id."""
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -3332,11 +3332,9 @@ def _score_geopolitical_events(candidates, analyses):
             {"SAFE_HAVEN","OIL_INFLATION_RATES","USD_LIQUIDITY","TRADE_INFLATION","SANCTIONS_FINANCIAL","MIXED","NONE"},
             "NONE",
         )
-        gold_channel_direction = weighted_choice(
-            "gold_channel_direction",
-            {"BULLISH_GOLD","BEARISH_GOLD","MIXED","UNCERTAIN"},
-            "UNCERTAIN",
-        )
+        # V10: an event may suggest a transmission PATHWAY, but never a gold
+        # direction by itself. Direction requires live cross-asset confirmation.
+        gold_channel_direction = "UNCONFIRMED"
 
         stages = [str(a.get("stage") or "STATEMENT").upper() for _,_,a in members]
         stage = max(stages, key=lambda s: stage_rank.get(s,0))
@@ -3595,21 +3593,20 @@ def calculate_rates_engine(markets):
 
 
 def calculate_geo_gold_transmission(geopolitical, markets):
-    """V9: attribute geopolitical effects to gold only when mechanism + market confirm.
+    """V10: separate geopolitical RISK from gold DIRECTION.
 
-    V9 still had a causality problem: a weaker USD or lower yields could be caused by
-    macro data/Fed news, yet the Geo engine counted them as a bullish geopolitical
-    transmission. V9 requires TWO layers before assigning a directional Geo→Gold score:
+    The AI is allowed to identify only a plausible transmission PATHWAY for each
+    geopolitical event. It is NOT allowed to call the event bullish/bearish for
+    gold. Direction exists only when live cross-assets confirm the pathway.
 
-      A) semantic mechanism in the geopolitical events themselves; and
-      B) live cross-asset confirmation consistent with that mechanism.
+    Confirmed examples:
+      OIL_INFLATION_RATES + oil up + yields up -> bearish for gold.
+      SAFE_HAVEN + VIX up + yields flat/down -> bullish for gold.
+      USD_LIQUIDITY + DXY up -> bearish for gold.
 
-    Examples:
-      OIL_INFLATION_RATES + oil up + yields up -> bearish Geo transmission to gold.
-      SAFE_HAVEN + VIX up (+ usually yields down) -> bullish Geo transmission to gold.
-      USD/rates moving by themselves -> context only, NOT geopolitical attribution.
-
-    Gold's own price is intentionally excluded to avoid circular scoring.
+    If a pathway is plausible but cross-assets do not confirm it, Geo Gold
+    Transmission stays exactly neutral at 50. Gold's own price is excluded to
+    avoid circular scoring.
     """
     risk_level = float(geopolitical.get("risk_level", geopolitical.get("score", 50.0)) or 50.0)
     momentum = float(geopolitical.get("risk_momentum", 0.0) or 0.0)
@@ -3621,23 +3618,18 @@ def calculate_geo_gold_transmission(geopolitical, markets):
     rates_engine = calculate_rates_engine(markets)
     weighted_bps = float(rates_engine.get("weighted_bps") or 0.0)
 
-    # Semantic channel pressure. These are NOT scores yet; they say what mechanisms
-    # the current geopolitical events plausibly contain.
-    channel_weights = {
-        "SAFE_HAVEN_BULL": 0.0,
-        "SAFE_HAVEN_BEAR": 0.0,
-        "OIL_RATES_BEAR": 0.0,
-        "USD_BEAR": 0.0,
-        "TRADE_BEAR": 0.0,
-        "SANCTIONS_BULL": 0.0,
-        "SANCTIONS_BEAR": 0.0,
+    # Pathway pressure only. No sign is assigned here.
+    path = {
+        "SAFE_HAVEN": 0.0,
+        "OIL_INFLATION_RATES": 0.0,
+        "USD_LIQUIDITY": 0.0,
+        "TRADE_INFLATION": 0.0,
+        "SANCTIONS_FINANCIAL": 0.0,
+        "MIXED": 0.0,
     }
-    semantic_bull = 0.0
-    semantic_bear = 0.0
 
     for e in events:
         channel = str(e.get("gold_channel") or "NONE").upper()
-        direction = str(e.get("gold_channel_direction") or "UNCERTAIN").upper()
         try:
             strength = clamp(float(e.get("gold_channel_strength", 0) or 0)) / 100.0
         except Exception:
@@ -3655,32 +3647,20 @@ def calculate_geo_gold_transmission(geopolitical, markets):
         except Exception:
             pressure = 0.0
 
-        weight = max(0.10, pressure) * strength * conf * max(0.20, gold_rel)
-        if direction == "BULLISH_GOLD":
-            semantic_bull += weight
-        elif direction == "BEARISH_GOLD":
-            semantic_bear += weight
+        w = max(0.10, pressure) * strength * conf * max(0.20, gold_rel)
+        if channel in path:
+            path[channel] += w
 
-        if channel == "SAFE_HAVEN":
-            if direction == "BULLISH_GOLD":
-                channel_weights["SAFE_HAVEN_BULL"] += weight
-            elif direction == "BEARISH_GOLD":
-                channel_weights["SAFE_HAVEN_BEAR"] += weight
-        elif channel == "OIL_INFLATION_RATES" and direction == "BEARISH_GOLD":
-            channel_weights["OIL_RATES_BEAR"] += weight
-        elif channel == "USD_LIQUIDITY" and direction == "BEARISH_GOLD":
-            channel_weights["USD_BEAR"] += weight
-        elif channel == "TRADE_INFLATION" and direction == "BEARISH_GOLD":
-            channel_weights["TRADE_BEAR"] += weight
-        elif channel == "SANCTIONS_FINANCIAL":
-            if direction == "BULLISH_GOLD":
-                channel_weights["SANCTIONS_BULL"] += weight
-            elif direction == "BEARISH_GOLD":
-                channel_weights["SANCTIONS_BEAR"] += weight
+    # Saturate repeated headlines. Many stories about one mechanism should not
+    # create unlimited confirmation strength.
+    factors = {k: min(1.0, v / 2.5) for k, v in path.items()}
 
-    # Convert accumulated semantic weights to 0..1 activation factors. Saturation
-    # prevents ten similar headlines from multiplying the same mechanism forever.
-    factors = {k: min(1.0, v / 2.5) for k, v in channel_weights.items()}
+    # MIXED events contribute weakly to all plausible channels; sanctions can
+    # plausibly transmit through either safe-haven or USD/financial stress.
+    safe_factor = min(1.0, factors["SAFE_HAVEN"] + 0.30*factors["SANCTIONS_FINANCIAL"] + 0.20*factors["MIXED"])
+    oil_rates_factor = min(1.0, factors["OIL_INFLATION_RATES"] + 0.30*factors["TRADE_INFLATION"] + 0.15*factors["MIXED"])
+    usd_factor = min(1.0, factors["USD_LIQUIDITY"] + 0.35*factors["SANCTIONS_FINANCIAL"] + 0.15*factors["MIXED"])
+    trade_factor = min(1.0, factors["TRADE_INFLATION"] + 0.15*factors["MIXED"])
 
     dollar_channel = 0.0
     rates_channel = 0.0
@@ -3688,52 +3668,51 @@ def calculate_geo_gold_transmission(geopolitical, markets):
     riskoff_channel = 0.0
     confirmations = []
 
-    # 1) Oil/inflation/rates bearish channel: must see BOTH oil and yields confirming.
-    oil_bear_factor = max(factors["OIL_RATES_BEAR"], factors["TRADE_BEAR"] * 0.55)
-    if oil_bear_factor > 0.08 and oil_change >= 0.25 and weighted_bps >= 0.75:
-        oil_channel = -min(5.0, oil_change * 0.70) * oil_bear_factor
-        rates_channel += -min(5.0, weighted_bps * 0.38) * oil_bear_factor
-        confirmations.append("OIL↑ + YIELDS↑ confirm inflation/tightening channel")
+    # Bearish energy/inflation pathway: require oil AND yields to rise together.
+    if oil_rates_factor > 0.08 and oil_change >= 0.25 and weighted_bps >= 0.75:
+        oil_channel = -min(5.5, oil_change * 0.75) * oil_rates_factor
+        rates_channel += -min(5.5, weighted_bps * 0.40) * oil_rates_factor
+        confirmations.append("OIL↑ + YIELDS↑ confirm geopolitical inflation/tightening channel")
 
-    # 2) Safe-haven bullish channel: VIX/risk-off must confirm. Falling yields can
-    # strengthen it, but falling yields alone can be a Fed/data story and are ignored.
-    safe_bull_factor = max(factors["SAFE_HAVEN_BULL"], factors["SANCTIONS_BULL"] * 0.45)
-    if safe_bull_factor > 0.08 and vix_change >= 0.75:
-        riskoff_channel = min(5.0, vix_change * 0.14) * safe_bull_factor
+    # Trade inflation: yields must rise and at least one inflation/liquidity proxy
+    # must agree. This avoids calling tariffs bearish from a headline alone.
+    if trade_factor > 0.08 and weighted_bps >= 0.75 and (dxy_change >= 0.10 or oil_change >= 0.25):
+        rates_channel += -min(3.0, weighted_bps * 0.22) * trade_factor
+        if dxy_change >= 0.10:
+            dollar_channel += -min(2.5, dxy_change * 5.0) * trade_factor
+        confirmations.append("YIELDS↑ with USD/OIL confirms trade-inflation headwind")
+
+    # Bullish safe-haven pathway: VIX alone is NOT enough. Require risk-off plus
+    # yields flat/down so a simultaneous inflation/tightening regime cannot be
+    # mislabeled as bullish for gold.
+    if safe_factor > 0.08 and vix_change >= 0.75 and weighted_bps <= 0.0:
+        riskoff_channel = min(5.0, vix_change * 0.14) * safe_factor
         if weighted_bps <= -0.75:
-            rates_channel += min(3.5, abs(weighted_bps) * 0.25) * safe_bull_factor
-        confirmations.append("VIX↑ confirms safe-haven/risk-off channel")
+            rates_channel += min(3.5, abs(weighted_bps) * 0.24) * safe_factor
+        confirmations.append("VIX↑ + non-rising yields confirm safe-haven support")
 
-    # 3) Loss of safe-haven demand / de-escalation. VIX must be falling; otherwise
-    # we do not attribute a bearish gold move to geopolitics.
-    safe_bear_factor = factors["SAFE_HAVEN_BEAR"]
-    if safe_bear_factor > 0.08 and vix_change <= -0.75:
-        riskoff_channel = -min(4.0, abs(vix_change) * 0.12) * safe_bear_factor
-        confirmations.append("VIX↓ confirms fading safe-haven demand")
-
-    # 4) Dollar/liquidity geopolitical channel. A stronger dollar only counts when
-    # the semantic event mechanism itself points to USD/liquidity demand.
-    usd_bear_factor = max(factors["USD_BEAR"], factors["SANCTIONS_BEAR"] * 0.40)
-    if usd_bear_factor > 0.08 and dxy_change >= 0.15:
-        dollar_channel = -min(5.0, dxy_change * 8.0) * usd_bear_factor
-        confirmations.append("USD↑ confirms geopolitical liquidity/dollar channel")
+    # Bearish USD/liquidity pathway: only when the event pathway permits it AND
+    # DXY is actually rising.
+    if usd_factor > 0.08 and dxy_change >= 0.15:
+        dollar_channel += -min(5.0, dxy_change * 8.0) * usd_factor
+        confirmations.append("USD↑ confirms geopolitical dollar/liquidity headwind")
 
     raw_channel = dollar_channel + rates_channel + riskoff_channel + oil_channel
 
-    # Risk level/momentum may amplify a CONFIRMED transmission, but never choose its
-    # sign and never create a signal from unrelated cross-asset moves.
+    # High risk can amplify only an already CONFIRMED direction; risk itself can
+    # never create a bullish or bearish gold signal.
     intensity = 1.0
     if abs(raw_channel) > 0.05:
         if risk_level > 50:
-            intensity += min(0.25, (risk_level - 50.0) / 90.0)
-        intensity += min(0.12, abs(momentum) / 700.0)
+            intensity += min(0.20, (risk_level - 50.0) / 100.0)
+        intensity += min(0.10, abs(momentum) / 900.0)
 
     delta = raw_channel * intensity
     score = clamp(50.0 + delta, 30.0, 70.0)
 
     if not confirmations or abs(delta) < 0.35:
         score = 50.0
-        regime = "GEO→GOLD ATTRIBUTION UNCONFIRMED / NEUTRAL"
+        regime = "GEO→GOLD DIRECTION UNCONFIRMED / NEUTRAL"
         attribution_status = "UNCONFIRMED"
     elif delta >= 5.0:
         regime = "CONFIRMED BULLISH GEO TRANSMISSION TO GOLD"
@@ -3748,18 +3727,18 @@ def calculate_geo_gold_transmission(geopolitical, markets):
         regime = "MILD CONFIRMED GEO HEADWIND FOR GOLD"
         attribution_status = "PARTIAL BEARISH"
 
-    if semantic_bull > semantic_bear * 1.25:
-        semantic_bias = "BULLISH POTENTIAL"
-    elif semantic_bear > semantic_bull * 1.25:
-        semantic_bias = "BEARISH POTENTIAL"
-    else:
-        semantic_bias = "MIXED / UNCERTAIN"
+    active_paths = []
+    for name, val in sorted(factors.items(), key=lambda kv: kv[1], reverse=True):
+        if val >= 0.08:
+            active_paths.append(name)
+    pathway_summary = " / ".join(active_paths[:4]) if active_paths else "NONE"
 
     return {
         "score": round(score, 1),
         "regime": regime,
         "attribution_status": attribution_status,
-        "semantic_bias": semantic_bias,
+        "semantic_bias": "DIRECTION NOT ASSIGNED FROM RISK",
+        "potential_pathways": pathway_summary,
         "confirmation_count": len(confirmations),
         "confirmations": confirmations[:4],
         "raw_channel": round(raw_channel, 2),
@@ -3772,8 +3751,7 @@ def calculate_geo_gold_transmission(geopolitical, markets):
         "weighted_bps": round(weighted_bps, 2),
         "oil_change": round(oil_change, 3),
         "vix_change": round(vix_change, 3),
-        "semantic_bull_pressure": round(semantic_bull, 2),
-        "semantic_bear_pressure": round(semantic_bear, 2),
+        "pathway_factors": {k: round(v, 2) for k, v in factors.items()},
     }
 
 def calculate_scores(markets, fed_score, economic_score, geopolitical_gold_score):
@@ -4051,7 +4029,7 @@ def dashboard():
 <div class="note" style="margin-top:5px"><strong>{{ data.geopolitical.gold_transmission_regime|default("Gold transmission pending") }}</strong></div>
 <div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong>{% if data.geopolitical.ai_scale_normalized %} • Score scale: <strong>normalized 0-10 → 0-100</strong>{% endif %}</div>
 {% if data.geopolitical.gold_transmission %}
-<div class="note">Attribution: <strong>{{ data.geopolitical.gold_transmission.attribution_status|default("UNCONFIRMED") }}</strong> • Event mechanism: <strong>{{ data.geopolitical.gold_transmission.semantic_bias|default("MIXED / UNCERTAIN") }}</strong> • Confirmed channels: <strong>{{ data.geopolitical.gold_transmission.confirmation_count|default(0) }}</strong></div>
+<div class="note"><strong>Risk level does not determine gold direction.</strong> Attribution: <strong>{{ data.geopolitical.gold_transmission.attribution_status|default("UNCONFIRMED") }}</strong> • Potential pathways: <strong>{{ data.geopolitical.gold_transmission.potential_pathways|default("NONE") }}</strong> • Confirmed channels: <strong>{{ data.geopolitical.gold_transmission.confirmation_count|default(0) }}</strong></div>
 <div class="note">Gold transmission channels: USD <strong class="{% if data.geopolitical.gold_transmission.dollar_channel>0 %}positive{% elif data.geopolitical.gold_transmission.dollar_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.dollar_channel }}</strong> • Rates <strong class="{% if data.geopolitical.gold_transmission.rates_channel>0 %}positive{% elif data.geopolitical.gold_transmission.rates_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.rates_channel }}</strong> • Oil/Inflation <strong class="{% if data.geopolitical.gold_transmission.oil_channel>0 %}positive{% elif data.geopolitical.gold_transmission.oil_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.oil_channel }}</strong> • Risk-off/VIX <strong class="{% if data.geopolitical.gold_transmission.riskoff_channel>0 %}positive{% elif data.geopolitical.gold_transmission.riskoff_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.riskoff_channel }}</strong> • Confirmed-risk amplifier ×{{ data.geopolitical.gold_transmission.intensity }}</div>
 {% if data.geopolitical.gold_transmission.confirmations %}<div class="note">Confirmation: {% for c in data.geopolitical.gold_transmission.confirmations %}{{ c }}{% if not loop.last %} • {% endif %}{% endfor %}</div>{% endif %}
 {% endif %}
@@ -4071,7 +4049,7 @@ def dashboard():
 {% set geoclass='tone-hawkish' if event.direction=='ESCALATION' else ('tone-dovish' if event.direction=='DE_ESCALATION' else '') %}
 <div class="tone {{ geoclass }}">{{ event.direction }} • {{ event.stage }}</div>
 <div class="impact">Severity: {{ event.severity }}/100 • Gold relevance: {{ event.gold_relevance }}/100 • Confidence: {{ event.confidence }}% • Risk pressure: {% if event.risk_pressure|default(event.impact)>0 %}+{% endif %}{{ event.risk_pressure|default(event.impact) }}</div>
-<div class="note">Gold mechanism: <strong>{{ event.gold_channel|default("NONE") }}</strong> • {{ event.gold_channel_direction|default("UNCERTAIN") }} • strength {{ event.gold_channel_strength|default(0) }}/100</div>
+<div class="note">Potential transmission: <strong>{{ event.gold_channel|default("NONE") }}</strong> • <strong>GOLD DIRECTION NOT CONFIRMED</strong> • mechanism strength {{ event.gold_channel_strength|default(0) }}/100</div>
 <div class="event-title" style="margin-top:8px">{{ event.summary }}</div>
 <div class="note" style="margin-top:8px">Sources: {{ event.source_count }} • {% for s in event.sources %}{{ s }}{% if not loop.last %}, {% endif %}{% endfor %}</div>
 <div class="news-meta">{{ event.date or '' }}</div>
