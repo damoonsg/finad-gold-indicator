@@ -2920,9 +2920,10 @@ Calibration examples (generic, not facts about the current feed):
 - "A ceasefire is signed or forces begin withdrawal" => DE_ESCALATION, CEASEFIRE_DEAL or DIPLOMATIC_ACTION.
 - A headline can be evaluated from the claim it reports. If details are limited, lower confidence; do NOT zero out severity/relevance merely because only a headline is supplied.
 - Do not return an all-zero/all-NEUTRAL batch when the supplied headlines themselves report concrete strikes, deployments, sanctions, ceasefires, or trade actions.
+- CRITICAL SCALE RULE: severity, market_relevance, gold_relevance, oil_relevance, and confidence MUST each be scored on a 0-100 scale. NEVER use a 0-10 scale. Example: high severity is 75, not 7.5 or 8.
 
 Return ONLY valid JSON:
-{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":0,"market_relevance":0,"gold_relevance":0,"oil_relevance":0,"confidence":0}]}.
+{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"confidence":85}]}.
 There must be exactly one object for every supplied id."""
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -3007,7 +3008,10 @@ There must be exactly one object for every supplied id."""
 
             clean = [by_id[i] for i in sorted(by_id)]
             if clean:
-                # V6 semantic quality gate: V5 showed that a model can return all
+                clean, _scale_fixed = _normalize_geo_ai_metric_scale(clean)
+                # V7 semantic quality gate: normalize accidental 0-10 scoring first,
+                # then evaluate whether the response contains meaningful signals.
+                # V6 showed that a model can return all
                 # requested IDs yet classify every geopolitical headline as zero/neutral.
                 # That is structurally valid but analytically useless. In that case
                 # try the independent fallback model instead of silently scoring 50.
@@ -3042,6 +3046,47 @@ There must be exactly one object for every supplied id."""
             continue
 
     raise RuntimeError(" | ".join(all_errors)[-1100:])
+
+
+def _normalize_geo_ai_metric_scale(analyses):
+    """Normalize occasional 0-10 model scoring to the dashboard's 0-100 scale.
+
+    Some compact models correctly classify direction/stage/materiality but return
+    severity/relevance as 0-10 despite a requested 0-100 schema. V6 then discarded
+    genuine events because values such as gold_relevance=6 were interpreted as 6/100.
+    Detect that batch-level scale mismatch and convert the four impact metrics only.
+    Confidence is left untouched because models usually already return it as 0-100.
+    """
+    fields = ("severity", "market_relevance", "gold_relevance", "oil_relevance")
+    vals = []
+    for a in analyses or []:
+        for field in fields:
+            try:
+                v = float(a.get(field))
+            except Exception:
+                continue
+            if v >= 0:
+                vals.append(v)
+
+    # Batch-level inference avoids turning a genuinely tiny 7/100 score into 70.
+    # If every supplied impact metric is <=10 and at least one has signal, the model
+    # clearly used a 0-10 rubric for this response.
+    scale10 = bool(vals) and max(vals) <= 10.0 and any(v > 0 for v in vals)
+    if not scale10:
+        return analyses, False
+
+    normalized = []
+    for a in analyses or []:
+        b = dict(a)
+        for field in fields:
+            try:
+                v = float(b.get(field, 0) or 0)
+                b[field] = round(max(0.0, min(100.0, v * 10.0)), 1)
+            except Exception:
+                pass
+        b["_scale_normalized_0_10_to_0_100"] = True
+        normalized.append(b)
+    return normalized, True
 
 
 def _score_geopolitical_events(candidates, analyses):
@@ -3287,6 +3332,7 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
         result["candidate_count"] = len(candidates)
         result["ai_analysis_count"] = len(analyses)
         result["ai_missing_count"] = max(0, len(candidates) - len(analyses))
+        result["ai_scale_normalized"] = any(bool(a.get("_scale_normalized_0_10_to_0_100")) for a in analyses)
         by_ai_id = {}
         for a in analyses:
             try:
@@ -3652,7 +3698,7 @@ def dashboard():
 </div>
 <div class="panel" style="margin-top:12px;margin-bottom:12px">
 <div class="news-title">{{ data.geopolitical.regime }}</div>
-<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong></div>
+<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong>{% if data.geopolitical.ai_scale_normalized %} • Score scale: <strong>normalized 0-10 → 0-100</strong>{% endif %}</div>
 {% if data.geopolitical.error %}<div class="note" style="color:#e6a36f">Geo engine detail: {{ data.geopolitical.error }}</div>{% endif %}
 {% if data.geopolitical.event_count == 0 and data.geopolitical.candidate_diagnostics %}
 <details style="margin-top:10px"><summary class="note" style="cursor:pointer">Show Geo candidate diagnostics</summary>
