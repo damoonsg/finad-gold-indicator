@@ -14,6 +14,8 @@ import json
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+FINAD_VERSION = "V13"
+
 app = Flask(__name__)
 
 HEADERS = {
@@ -1434,13 +1436,15 @@ def _fed_speaker_bundles(documents):
 
 
 def _groq_semantic_fed_analysis(documents):
-    """V11: resilient semantic Fed analysis, speaker by speaker when needed.
+    """V13: low-call-budget Fed semantic analysis.
 
-    The primary 120b model remains preferred. If the large all-speaker request is
-    rate-limited, truncated, or temporarily unavailable, V11 falls back to a
-    smaller semantic model and then retries only missing speakers in small chunks
-    and finally one-by-one. A failed first request therefore no longer forces the
-    whole Fed monitor to reuse a stale result.
+    Free-tier reliability matters more than aggressive retrying. V12 could issue
+    many recovery calls and then leave only 1/9 speakers analyzed after provider
+    limits were hit. V13 uses at most three model calls:
+      1) primary 120b for all speakers,
+      2) qwen fallback for only missing speakers,
+      3) 20b fallback for anything still missing.
+    Valid outputs are merged cumulatively and are never discarded.
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -1451,27 +1455,20 @@ def _groq_semantic_fed_analysis(documents):
         return [], []
 
     system_prompt = """You are a Federal Reserve monetary-policy analyst. Read meaning, not keyword counts.
-
-Each item is ONE Fed speaker and may contain up to two recent source documents: official Federal Reserve System material and/or UtoFX/UtoTimes reporting. Decide the speaker's latest CURRENT monetary-policy stance after considering all supplied documents together.
-
+Each item is ONE Fed speaker and may contain up to two recent source documents. Decide the speaker's latest CURRENT monetary-policy stance after considering all supplied documents together.
 Rules:
 1. Forward guidance about the NEXT rate move has the highest weight.
-2. A prior hike/cut/vote is historical context unless the speaker links it to the next move.
-3. Inflation concern alone does not make the overall stance hawkish.
-4. "More time", "wait for data", "no urgency", or similar patience language normally means neutral/slightly dovish unless another near-term hike is clearly advocated.
-5. If an official source and Uto describe the SAME episode and conflict, prefer the official source. But an unrelated official speech must NOT suppress a newer policy-relevant Uto quote/Q&A.
-6. If none of the supplied documents gives meaningful current policy guidance, set policy_relevant=false.
-7. Never increase hawkish/dovish strength because a phrase is repeated.
-
+2. A prior hike/cut/vote is historical unless linked to the next move.
+3. Inflation concern alone does not make the stance hawkish.
+4. Patience/more data/no urgency normally means neutral/slightly dovish unless a near-term hike is clearly advocated.
+5. Prefer official Fed material when it covers the same episode; a newer unrelated Uto quote may still matter.
+6. If no meaningful current policy guidance exists, policy_relevant=false.
+7. Never strengthen a stance because wording is repeated.
 stance_score: -2 strongly dovish, -1 dovish, -0.5 slightly dovish, 0 neutral, +0.5 slightly hawkish, +1 hawkish, +2 strongly hawkish.
-
-You MUST return exactly ONE analysis object for EVERY supplied item id. NEVER renumber ids. Copy the supplied id and speaker name exactly, even when policy_relevant=false. Keep summary to max 24 words.
-
+Return exactly ONE object for EVERY supplied id. Copy id and speaker exactly. Keep summary under 24 words.
 Return ONLY valid JSON:
 {"analyses":[{"id":1,"speaker":"Name","policy_relevant":true,"selected_doc_id":1,"summary":"short factual summary","inflation_view":"NEUTRAL","labor_view":"NEUTRAL","rate_path_view":"NEUTRAL","stance_score":0.0,"confidence":85}]}
-
-selected_doc_id is the document inside that speaker bundle that best supports the current stance, or null if policy_relevant=false.
-Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DOVISH, STRONGLY DOVISH, MIXED, NOT DISCUSSED."""
+selected_doc_id is the document inside that bundle that best supports the current stance, or null if policy_relevant=false."""
 
     items = []
     for bundle_id, bundle in enumerate(bundles, 1):
@@ -1489,154 +1486,116 @@ Views: STRONGLY HAWKISH, HAWKISH, SLIGHTLY HAWKISH, NEUTRAL, SLIGHTLY DOVISH, DO
         items.append({"id": bundle_id, "speaker": bundle["speaker"], "documents": doc_items})
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    fed_models = []
-    for model in (GROQ_MODEL, FED_GROQ_FALLBACK_MODEL, GEO_GROQ_FALLBACK_MODEL):
-        if model and model not in fed_models:
-            fed_models.append(model)
+    recovery_models = []
+    for m in (GEO_GROQ_FALLBACK_MODEL, FED_GROQ_FALLBACK_MODEL):
+        if m and m != GROQ_MODEL and m not in recovery_models:
+            recovery_models.append(m)
 
-    def call_fed_ai(bundle_items, max_tokens=2200):
-        errors = []
-        for model in fed_models:
-            base_payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps({"speaker_bundles": bundle_items}, ensure_ascii=False)},
-                ],
-                "temperature": 0.05,
-                "max_tokens": max_tokens,
-            }
-            if model.startswith("openai/gpt-oss-"):
-                base_payload["reasoning_effort"] = "low"
+    def call_one_model(model, bundle_items, max_tokens):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps({
+                    "required_ids": [int(x["id"]) for x in bundle_items],
+                    "speaker_bundles": bundle_items,
+                }, ensure_ascii=False)},
+            ],
+            "temperature": 0.05,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if model.startswith("openai/gpt-oss-"):
+            payload["reasoning_effort"] = "low"
+        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 30))
+        if r.status_code == 429:
+            raise RuntimeError(f"GROQ RATE LIMIT on {model} (retry-after {r.headers.get('retry-after','unknown')}s)")
+        if r.status_code >= 400:
+            detail = (r.text or "").replace("\n", " ")[:420]
+            raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
+        parsed = _parse_json_object(r.json()["choices"][0]["message"]["content"])
+        rows = parsed.get("analyses")
+        if not isinstance(rows, list):
+            raise ValueError(f"Fed AI response missing analyses array on {model}")
+        return rows
 
-            # JSON mode is preferred, but a model-specific JSON-mode failure should
-            # not discard an otherwise usable semantic response.
-            for use_json_mode in (True, False):
-                payload = dict(base_payload)
-                if use_json_mode:
-                    payload["response_format"] = {"type": "json_object"}
-                try:
-                    r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 28))
-                    if r.status_code == 429:
-                        retry_after = r.headers.get("retry-after", "unknown")
-                        raise RuntimeError(f"GROQ RATE LIMIT on {model} (retry-after {retry_after}s)")
-                    if r.status_code >= 400:
-                        detail = (r.text or "").replace("\n", " ")[:420]
-                        if r.status_code == 400 and use_json_mode:
-                            errors.append(f"GROQ HTTP 400 on {model}: {detail}")
-                            continue
-                        raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
-                    content = r.json()["choices"][0]["message"]["content"]
-                    parsed = _parse_json_object(content)
-                    analyses = parsed.get("analyses")
-                    if not isinstance(analyses, list):
-                        raise ValueError("AI response missing analyses array")
-                    return analyses, model
-                except Exception as exc:
-                    errors.append(str(exc))
-                    if use_json_mode:
-                        continue
-                    break
-        raise RuntimeError(" | ".join(errors)[-1200:])
-
-    expected_ids = set(range(1, len(bundles) + 1))
-    speaker_to_id = {normalize_text(bundle.get("speaker") or "").strip(): i for i, bundle in enumerate(bundles, 1)}
+    expected_ids = set(range(1, len(bundles)+1))
+    speaker_to_id = {normalize_text(b.get("speaker") or "").strip(): i for i,b in enumerate(bundles,1)}
     by_id = {}
-    recovered_ids = set()
     errors = []
 
-    def absorb(rows, allowed_ids=None, force_single_id=None, mark_recovered=False, model_used=None, allow_local_renumber=False):
-        allowed_order = sorted(set(allowed_ids or expected_ids))
-        allowed = set(allowed_order)
-        local_map = {i + 1: aid for i, aid in enumerate(allowed_order)}
-        valid_rows = [a for a in (rows or []) if isinstance(a, dict)]
-        for a in valid_rows:
+    def absorb(rows, allowed_ids, model, recovered=False):
+        allowed = set(allowed_ids)
+        allowed_order = sorted(allowed)
+        local_map = {i+1: aid for i, aid in enumerate(allowed_order)}
+        for a in (rows or []):
+            if not isinstance(a, dict):
+                continue
             aid = None
-            candidate_id = None
             try:
-                candidate_id = int(a.get("id"))
-                if candidate_id in allowed:
-                    aid = candidate_id
+                raw_id = int(a.get("id"))
             except Exception:
-                pass
+                raw_id = None
+            if raw_id in allowed:
+                aid = raw_id
             if aid is None:
-                speaker_key = normalize_text(a.get("speaker") or "").strip()
-                mapped = speaker_to_id.get(speaker_key)
+                sp = normalize_text(a.get("speaker") or "").strip()
+                mapped = speaker_to_id.get(sp)
                 if mapped in allowed:
                     aid = mapped
-            # Some compact models renumber a recovery batch 1..N. For a batch
-            # whose allowed ids are e.g. [5,7,9], map local 1,2,3 back safely.
-            if aid is None and allow_local_renumber and candidate_id in local_map:
-                aid = local_map[candidate_id]
-            if aid is None and force_single_id is not None and len(valid_rows) == 1:
-                aid = force_single_id
-            if aid is None or aid not in allowed:
+            if aid is None and raw_id in local_map:
+                aid = local_map[raw_id]
+            if aid is None or aid not in allowed or aid in by_id:
                 continue
             row = dict(a)
             row["id"] = aid
-            row["speaker"] = bundles[aid - 1].get("speaker")
-            if model_used:
-                row["_ai_model"] = model_used
-            if mark_recovered:
+            row["speaker"] = bundles[aid-1].get("speaker")
+            row["_ai_model"] = model
+            if recovered:
                 row["recovered_output"] = True
-                recovered_ids.add(aid)
             by_id[aid] = row
 
-    # Fast path: one request for all speakers. Failure here is no longer fatal.
+    # Call 1: primary model for all speakers.
     try:
-        rows, model_used = call_fed_ai(items, 2200)
-        absorb(rows, model_used=model_used)
+        rows = call_one_model(GROQ_MODEL, items, 2400)
+        absorb(rows, expected_ids, GROQ_MODEL, recovered=False)
     except Exception as exc:
-        errors.append(f"initial: {exc}")
+        errors.append(str(exc))
 
-    # Recover missing speakers in small batches. Small payloads are much less prone
-    # to output truncation and also allow a fallback model to take over cleanly.
-    missing = sorted(expected_ids - set(by_id))
-    for offset in range(0, len(missing), 3):
-        chunk_ids = missing[offset:offset + 3]
-        chunk_items = [x for x in items if int(x.get("id", 0)) in chunk_ids]
-        if not chunk_items:
-            continue
+    # Calls 2-3: each fallback gets only the currently missing speakers.
+    for model in recovery_models:
+        missing = sorted(expected_ids - set(by_id))
+        if not missing:
+            break
+        subset = [x for x in items if int(x.get("id",0)) in missing]
         try:
-            rows, model_used = call_fed_ai(chunk_items, max(800, 420 * len(chunk_items)))
-            absorb(rows, allowed_ids=chunk_ids, mark_recovered=True, model_used=model_used, allow_local_renumber=True)
+            rows = call_one_model(model, subset, max(1000, min(2400, 300*len(subset))))
+            absorb(rows, missing, model, recovered=True)
         except Exception as exc:
-            errors.append(f"chunk {chunk_ids}: {exc}")
+            errors.append(str(exc))
 
-    # Final one-speaker retry. Any single valid object can be mapped to that speaker
-    # even if the model incorrectly emits id=1.
     still_missing = sorted(expected_ids - set(by_id))
     for aid in still_missing:
-        single_item = [x for x in items if int(x.get("id", 0)) == aid]
-        if not single_item:
-            continue
-        try:
-            rows, model_used = call_fed_ai(single_item, 700)
-            absorb(rows, allowed_ids={aid}, force_single_id=aid, mark_recovered=True, model_used=model_used, allow_local_renumber=True)
-        except Exception as exc:
-            errors.append(f"single {aid}: {exc}")
-
-    # Keep diagnostic placeholders for any genuinely unrecovered speaker, but they
-    # are excluded from cards and score by _build_semantic_fed_result.
-    still_missing = sorted(expected_ids - set(by_id))
-    for aid in still_missing:
-        speaker = bundles[aid - 1].get("speaker") if 1 <= aid <= len(bundles) else "Unknown"
         by_id[aid] = {
-            "id": aid, "speaker": speaker, "policy_relevant": False,
+            "id": aid,
+            "speaker": bundles[aid-1].get("speaker"),
+            "policy_relevant": False,
             "selected_doc_id": None,
             "summary": "AI output missing for this speaker in this refresh.",
-            "inflation_view": "NOT DISCUSSED", "labor_view": "NOT DISCUSSED",
-            "rate_path_view": "NOT DISCUSSED", "stance_score": 0.0,
-            "confidence": 0, "recovery_missing": True,
+            "inflation_view": "NOT DISCUSSED",
+            "labor_view": "NOT DISCUSSED",
+            "rate_path_view": "NOT DISCUSSED",
+            "stance_score": 0.0,
+            "confidence": 0,
+            "recovery_missing": True,
         }
 
-    valid_count = sum(1 for a in by_id.values() if not a.get("recovery_missing"))
+    valid_count = len(expected_ids) - len(still_missing)
     if valid_count == 0:
         raise RuntimeError("FED AI produced no valid current speaker analyses | " + " | ".join(errors)[-900:])
 
     cleaned = [by_id[i] for i in sorted(by_id)]
     return bundles, cleaned
-
 
 def _build_semantic_fed_result(bundles, analyses, candidate_count):
     by_id = {}
@@ -1843,9 +1802,27 @@ def get_fed_monitor(telegram_news, utotimes_news):
         result["official_discovered"] = discovered_official_count
         result["uto_discovered"] = discovered_uto_count
         result["uto_fed_items"] = len(fed_uto_items)
-        FED_AI_CACHE["fingerprint"] = fingerprint
-        FED_AI_CACHE["result"] = result
-        FED_AI_CACHE["time"] = now
+        # Only promote a sufficiently covered result to the durable AI cache.
+        # A 1/9 or 2/9 refresh must never replace a previously good semantic result.
+        bundle_count = max(1, int(result.get("speaker_bundle_count") or 1))
+        valid_count = int(result.get("analyzed_count") or 0)
+        min_good = max(3, int((bundle_count * 0.67) + 0.999))
+        if valid_count >= min_good:
+            FED_AI_CACHE["fingerprint"] = fingerprint
+            FED_AI_CACHE["result"] = result
+            FED_AI_CACHE["time"] = now
+        else:
+            previous = FED_AI_CACHE.get("result")
+            if previous:
+                current_cov = f"{valid_count}/{bundle_count}"
+                fallback_result = dict(previous)
+                fallback_result["status"] = f"USING LAST GOOD AI RESULT • CURRENT COVERAGE {current_cov}"
+                fallback_result["official_discovered"] = discovered_official_count
+                fallback_result["uto_discovered"] = discovered_uto_count
+                fallback_result["uto_fed_items"] = len(fed_uto_items)
+                result = fallback_result
+            else:
+                result["status"] = f"AI PARTIAL COVERAGE • {valid_count}/{bundle_count}"
     except Exception as exc:
         # Never fall back to keyword scoring. If AI is unavailable, neutralize this
         # component instead of presenting a misleading hawkish/dovish number.
@@ -2944,17 +2921,17 @@ def _select_geo_candidates(items, limit=GEO_MAX_CANDIDATES):
 
 
 def _geo_fingerprint(items):
-    payload = [{"version":"V10","text":x.get("text"),"date":x.get("date"),"source":x.get("source")} for x in items]
+    payload = [{"version":"V13","text":x.get("text"),"date":x.get("date"),"source":x.get("source")} for x in items]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _groq_geopolitical_analysis(candidates):
-    """Analyze each geopolitical candidate semantically and recover missing IDs.
+    """V13: low-call-budget cumulative Geo analysis.
 
-    V5 keeps one semantic record per input item. If the first Groq response is
-    incomplete, a second compact request is sent only for the missing IDs. This
-    avoids silently treating omitted items as non-material while staying inside
-    the free-tier token budget.
+    V12's many repair calls could exhaust the free API budget. V13 caps normal
+    work at three calls: two primary batches (8 + 7), then one fallback request
+    for every unresolved id. Partial CURRENT coverage is returned truthfully and
+    never converted into a stale result merely because 1-2 ids are missing.
     """
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
@@ -2973,194 +2950,105 @@ def _groq_geopolitical_analysis(candidates):
         })
 
     system_prompt = """You are a global geopolitical-risk analyst for a GOLD macro dashboard.
-Analyze EACH supplied item by meaning and current policy/security significance, never by keyword counts. Return one analysis object for every supplied id.
-
-Materiality rule:
-- material=true for a CURRENT development with plausible non-trivial impact on gold, USD, rates, oil, shipping, sanctions risk, trade risk, or global risk appetite.
-- Ongoing conflicts still count when the item reports a new strike, deployment, warning, sanctions action, ceasefire move, negotiation development, blockade/shipping disruption, nuclear development, major tariff/export-control action, or other concrete change.
-- Do NOT require an event to be catastrophic or instantly market-moving.
-- A high-level official statement can be material as STATEMENT or THREAT even if action is not yet confirmed.
-- A Trump X/Truth post proves what was said, not that the threatened action occurred.
-- Distinguish STATEMENT/THREAT from PREPARATION, CONFIRMED_ACTION, and ACTIVE_CONFLICT.
-- DE_ESCALATION includes credible ceasefire, withdrawal, sanctions relief, substantive negotiations, or peace agreement.
-- Routine domestic politics, ordinary crime, opinion pieces without a fresh development, and historical background are material=false.
-
-Even when material=false, still fill direction, stage, severity, gold_relevance, oil_relevance, and confidence using your best semantic judgment. Use NEUTRAL only when the item genuinely carries no escalation/de-escalation signal.
-
-Also classify ONLY the PLAUSIBLE TRANSMISSION PATHWAY of the geopolitical development. This is NOT a gold-direction prediction. NEVER label a geopolitical event bullish or bearish for gold by itself and NEVER use generic "war = gold up" logic. Direction is determined later only if live cross-assets confirm the pathway.
-- SAFE_HAVEN: acute fear/risk-off demand is a possible pathway, but its gold direction remains UNCONFIRMED until VIX/rates confirm.
-- OIL_INFLATION_RATES: energy/shipping disruption may transmit through oil, inflation and yields.
-- USD_LIQUIDITY: stress may transmit through dollar/liquidity demand.
-- TRADE_INFLATION: tariffs/export controls may transmit through inflation/yields.
-- SANCTIONS_FINANCIAL: sanctions/financial fragmentation can transmit through several competing channels.
-- MIXED: more than one plausible pathway exists.
-- NONE: no plausible direct transmission pathway.
-
-Do NOT output BULLISH_GOLD or BEARISH_GOLD for an individual event. The event-level direction must remain UNCONFIRMED because the model has no live market prices. Never infer causality from market moves because no market prices are supplied here.
-Use a stable event_key so separate headlines about the same real-world event receive similar labels. Do not invent facts beyond the supplied item.
-
-Calibration examples (generic, not facts about the current feed):
-- "Country A deploys 10,000 troops and a carrier toward a conflict zone" => ESCALATION, PREPARATION, clearly non-zero severity and market relevance.
-- "Missiles hit a capital/port/refinery" => ESCALATION, CONFIRMED_ACTION or ACTIVE_CONFLICT if the headline reports it as having occurred.
-- "New sanctions/export controls/tariffs are imposed" => ESCALATION, SANCTIONS_ACTION or TRADE_ACTION, with non-zero market relevance.
-- "A ceasefire is signed or forces begin withdrawal" => DE_ESCALATION, CEASEFIRE_DEAL or DIPLOMATIC_ACTION.
-- A headline can be evaluated from the claim it reports. If details are limited, lower confidence; do NOT zero out severity/relevance merely because only a headline is supplied.
-- Do not return an all-zero/all-NEUTRAL batch when the supplied headlines themselves report concrete strikes, deployments, sanctions, ceasefires, or trade actions.
-- CRITICAL SCALE RULE: severity, market_relevance, gold_relevance, oil_relevance, gold_channel_strength, transmission_confidence, and confidence MUST each be scored on a 0-100 scale. NEVER use a 0-10 scale. Example: high severity is 75, not 7.5 or 8.
-
+Analyze EACH supplied item semantically. Return exactly one object for every supplied id.
+Material=true for a CURRENT development with plausible non-trivial effect on global risk, oil/shipping, sanctions/trade, USD/rates or gold-market conditions. Distinguish STATEMENT/THREAT/PREPARATION/CONFIRMED_ACTION/ACTIVE_CONFLICT/DIPLOMATIC_ACTION/CEASEFIRE_DEAL/SANCTIONS_ACTION/TRADE_ACTION. Routine domestic politics or stale background is material=false.
+Classify only the plausible TRANSMISSION PATHWAY, not gold direction: SAFE_HAVEN, OIL_INFLATION_RATES, USD_LIQUIDITY, TRADE_INFLATION, SANCTIONS_FINANCIAL, MIXED, NONE. Never say BULLISH_GOLD or BEARISH_GOLD; live market confirmation happens later.
+All numeric fields must be 0-100: severity, market_relevance, gold_relevance, oil_relevance, gold_channel_strength, transmission_confidence, confidence.
 Return ONLY valid JSON:
-{"analyses":[{"id":1,"material":true,"event_key":"short stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"gold_channel":"SAFE_HAVEN|OIL_INFLATION_RATES|USD_LIQUIDITY|TRADE_INFLATION|SANCTIONS_FINANCIAL|MIXED|NONE","gold_channel_strength":65,"transmission_confidence":75,"confidence":85}]}.
-There must be exactly one object for every supplied id."""
+{"analyses":[{"id":1,"material":true,"event_key":"stable event label","summary":"one concise factual sentence","region":"region/country pair","category":"MILITARY|NUCLEAR|SANCTIONS|TRADE|SHIPPING|TERROR_SECURITY|POLITICAL_INSTABILITY|DIPLOMACY|ENERGY_SECURITY|OTHER","direction":"ESCALATION|DE_ESCALATION|NEUTRAL","stage":"STATEMENT|THREAT|PREPARATION|CONFIRMED_ACTION|ACTIVE_CONFLICT|DIPLOMATIC_ACTION|CEASEFIRE_DEAL|SANCTIONS_ACTION|TRADE_ACTION","severity":70,"market_relevance":75,"gold_relevance":65,"oil_relevance":40,"gold_channel":"SAFE_HAVEN|OIL_INFLATION_RATES|USD_LIQUIDITY|TRADE_INFLATION|SANCTIONS_FINANCIAL|MIXED|NONE","gold_channel_strength":65,"transmission_confidence":75,"confidence":85}]}"""
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    models = []
-    for model in (GEO_GROQ_MODEL, GEO_GROQ_FALLBACK_MODEL):
-        if model and model not in models and model != GROQ_MODEL:
-            models.append(model)
-    if not models:
-        models = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+    primary = GEO_GROQ_MODEL
+    fallback = GEO_GROQ_FALLBACK_MODEL if GEO_GROQ_FALLBACK_MODEL != primary else None
 
-    def call_model(model, batch_docs, max_tokens):
-        base_payload = {
+    def call_one_model(model, batch_docs, max_tokens):
+        payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps({"items": batch_docs}, ensure_ascii=False)},
+                {"role":"system","content":system_prompt},
+                {"role":"user","content":json.dumps({
+                    "required_ids":[int(d["id"]) for d in batch_docs],
+                    "instruction":"Return one object for every required id; preserve original ids.",
+                    "items":batch_docs,
+                }, ensure_ascii=False)},
             ],
-            "temperature": 0.05,
-            "max_tokens": max_tokens,
+            "temperature":0.05,
+            "max_tokens":max_tokens,
+            "response_format":{"type":"json_object"},
         }
         if model.startswith("openai/gpt-oss-"):
-            base_payload["reasoning_effort"] = "low"
+            payload["reasoning_effort"] = "low"
+        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5,30))
+        if r.status_code == 429:
+            raise RuntimeError(f"GROQ RATE LIMIT on {model} (retry-after {r.headers.get('retry-after','unknown')}s)")
+        if r.status_code >= 400:
+            detail = (r.text or "").replace("\n"," ")[:420]
+            raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
+        parsed = _parse_json_object(r.json()["choices"][0]["message"]["content"])
+        rows = parsed.get("analyses")
+        if not isinstance(rows, list):
+            raise ValueError(f"Geo AI response missing analyses array on {model}")
+        return rows
 
-        errors = []
-        for use_json_mode in (True, False):
-            payload = dict(base_payload)
-            if use_json_mode:
-                payload["response_format"] = {"type": "json_object"}
-            try:
-                r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=(5, 30))
-                if r.status_code == 429:
-                    retry_after = r.headers.get("retry-after", "unknown")
-                    raise RuntimeError(f"GROQ RATE LIMIT on {model} (retry-after {retry_after}s)")
-                if r.status_code >= 400:
-                    detail = (r.text or "").replace("\n", " ")[:420]
-                    if r.status_code == 400 and use_json_mode:
-                        errors.append(f"GROQ HTTP 400 on {model}: {detail}")
-                        continue
-                    raise RuntimeError(f"GROQ HTTP {r.status_code} on {model}: {detail}")
-                parsed = _parse_json_object(r.json()["choices"][0]["message"]["content"])
-                analyses = parsed.get("analyses")
-                if not isinstance(analyses, list):
-                    raise ValueError("Geo AI response missing analyses array")
-                return analyses
-            except Exception as exc:
-                errors.append(str(exc))
-                if use_json_mode:
-                    continue
-                raise RuntimeError(" | ".join(errors)[-900:])
-        raise RuntimeError(" | ".join(errors)[-900:])
-
-    all_errors = []
     expected_ids = {int(d["id"]) for d in docs}
+    by_id, model_by_id, errors = {}, {}, []
+    attempts = 0
 
-    def absorb_geo(rows, by_id, allowed_ids, allow_local_renumber=False, force_single_id=None):
-        allowed_order = sorted(set(allowed_ids))
-        allowed = set(allowed_order)
-        local_map = {i + 1: aid for i, aid in enumerate(allowed_order)}
-        valid_rows = [a for a in (rows or []) if isinstance(a, dict)]
-        for a in valid_rows:
-            iid = None
-            candidate_id = None
-            try:
-                candidate_id = int(a.get("id"))
-                if candidate_id in allowed:
-                    iid = candidate_id
-            except Exception:
-                pass
-            # Recovery batches are sometimes renumbered 1..N by compact models.
-            if iid is None and allow_local_renumber and candidate_id in local_map:
-                iid = local_map[candidate_id]
-            if iid is None and force_single_id is not None and len(valid_rows) == 1:
-                iid = force_single_id
-            if iid is None or iid not in allowed:
+    def absorb(rows, allowed_ids, model):
+        allowed = set(allowed_ids)
+        local_map = {i+1: aid for i,aid in enumerate(sorted(allowed))}
+        for a in rows or []:
+            if not isinstance(a, dict):
                 continue
-            row = dict(a)
-            row["id"] = iid
-            by_id[iid] = row
+            try: raw = int(a.get("id"))
+            except Exception: raw = None
+            iid = raw if raw in allowed else local_map.get(raw)
+            if iid is None or iid in by_id:
+                continue
+            row = dict(a); row["id"] = iid; row["_ai_model"] = model
+            by_id[iid] = row; model_by_id[iid] = model
 
-    for model in models:
-        try:
-            by_id = {}
-            # First attempt: all 15 candidates. A partial response is useful and is
-            # completed below instead of being accepted as-is.
-            first = call_model(model, docs, 2400)
-            absorb_geo(first, by_id, expected_ids)
-
-            # V11: recover omitted candidates in chunks of three. Crucially, local
-            # ids 1..N are mapped back to the original candidate ids. This fixes the
-            # 11/15 pattern seen when a recovery request for ids such as 12..15 was
-            # answered as ids 1..4 and then discarded by V10.
-            missing_ids = sorted(expected_ids - set(by_id))
-            for offset in range(0, len(missing_ids), 3):
-                chunk_ids = missing_ids[offset:offset + 3]
-                missing_docs = [d for d in docs if int(d["id"]) in chunk_ids]
-                if not missing_docs:
-                    continue
-                try:
-                    recovered = call_model(model, missing_docs, max(850, 300 * len(missing_docs)))
-                    absorb_geo(recovered, by_id, chunk_ids, allow_local_renumber=True)
-                except Exception as recovery_exc:
-                    all_errors.append(f"recovery {model} {chunk_ids}: {recovery_exc}")
-
-            # Final one-item recovery: one valid object is safely assigned to the
-            # requested original id even if the model emits id=1.
-            still_missing = sorted(expected_ids - set(by_id))
-            for iid in still_missing:
-                one_doc = [d for d in docs if int(d["id"]) == iid]
-                if not one_doc:
-                    continue
-                try:
-                    recovered = call_model(model, one_doc, 650)
-                    absorb_geo(recovered, by_id, {iid}, allow_local_renumber=True, force_single_id=iid)
-                except Exception as recovery_exc:
-                    all_errors.append(f"single recovery {model} {iid}: {recovery_exc}")
-
-            clean = [by_id[i] for i in sorted(by_id)]
-            if clean:
-                clean, _scale_fixed = _normalize_geo_ai_metric_scale(clean)
-                signal_count = 0
-                for a in clean:
-                    try:
-                        sev = float(a.get("severity", 0) or 0)
-                    except Exception:
-                        sev = 0
-                    try:
-                        rel = float(a.get("gold_relevance", 0) or 0)
-                    except Exception:
-                        rel = 0
-                    try:
-                        mrel = float(a.get("market_relevance", 0) or 0)
-                    except Exception:
-                        mrel = 0
-                    direction = str(a.get("direction") or "NEUTRAL").upper()
-                    stage = str(a.get("stage") or "STATEMENT").upper()
-                    if (
-                        (direction in ("ESCALATION", "DE_ESCALATION") and (sev >= 12 or rel >= 10 or mrel >= 15))
-                        or stage in ("PREPARATION", "CONFIRMED_ACTION", "ACTIVE_CONFLICT", "CEASEFIRE_DEAL", "SANCTIONS_ACTION", "TRADE_ACTION")
-                    ):
-                        signal_count += 1
-                if len(clean) >= 5 and signal_count == 0:
-                    all_errors.append(f"Degenerate low-signal Geo response on {model}: 0/{len(clean)} semantic signals")
-                    continue
-                return clean, model
-            all_errors.append(f"No valid Geo analyses returned by {model}")
-        except Exception as exc:
-            all_errors.append(str(exc))
+    # Two bounded primary requests: ids 1-8 and 9-15.
+    for batch_docs in (docs[:8], docs[8:]):
+        if not batch_docs:
             continue
+        attempts += 1
+        ids = [int(d["id"]) for d in batch_docs]
+        try:
+            rows = call_one_model(primary, batch_docs, max(1500, 290*len(batch_docs)))
+            absorb(rows, ids, primary)
+        except Exception as exc:
+            errors.append(str(exc))
 
-    raise RuntimeError(" | ".join(all_errors)[-1400:])
+    # One fallback call for ALL unresolved ids. No per-id retry storm.
+    missing = sorted(expected_ids - set(by_id))
+    if missing and fallback:
+        subset = [d for d in docs if int(d["id"]) in missing]
+        attempts += 1
+        try:
+            rows = call_one_model(fallback, subset, max(1000, min(2400, 300*len(subset))))
+            absorb(rows, missing, fallback)
+        except Exception as exc:
+            errors.append(str(exc))
 
+    clean = [by_id[i] for i in sorted(by_id)]
+    if not clean:
+        raise RuntimeError("GEO AI produced no current analyses | " + " | ".join(errors)[-1000:])
+
+    clean, _scale_fixed = _normalize_geo_ai_metric_scale(clean)
+    used_models = []
+    for iid in sorted(model_by_id):
+        m = model_by_id[iid]
+        if m not in used_models:
+            used_models.append(m)
+    meta = {
+        "attempts": attempts,
+        "unresolved_ids": sorted(expected_ids - set(by_id)),
+        "errors": errors[-4:],
+        "coverage": len(clean),
+        "expected": len(expected_ids),
+    }
+    return clean, " + ".join(used_models) if used_models else primary, meta
 
 def _normalize_geo_ai_metric_scale(analyses):
     """Normalize occasional 0-10 model scoring to the dashboard's 0-100 scale.
@@ -3541,14 +3429,18 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
         return result
 
     try:
-        analyses, used_model = _groq_geopolitical_analysis(candidates)
+        analyses, used_model, geo_ai_meta = _groq_geopolitical_analysis(candidates)
         result = _score_geopolitical_events(candidates, analyses)
-        result["status"] = "OK"
+        unresolved_ids = list(geo_ai_meta.get("unresolved_ids") or [])
+        result["status"] = "OK" if not unresolved_ids else f"PARTIAL CURRENT AI • {len(unresolved_ids)} UNRESOLVED"
         result["ai_model"] = used_model
         result["source_stats"] = source_stats
         result["candidate_count"] = len(candidates)
         result["ai_analysis_count"] = len(analyses)
         result["ai_missing_count"] = max(0, len(candidates) - len(analyses))
+        result["ai_unresolved_ids"] = unresolved_ids
+        result["ai_attempts"] = int(geo_ai_meta.get("attempts") or 0)
+        result["ai_recovery_errors"] = list(geo_ai_meta.get("errors") or [])
         result["ai_scale_normalized"] = any(bool(a.get("_scale_normalized_0_10_to_0_100")) for a in analyses)
         by_ai_id = {}
         for a in analyses:
@@ -3571,12 +3463,19 @@ def get_geopolitical_monitor(telegram_news, utotimes_news):
                 "gold_relevance": a.get("gold_relevance", "-"),
                 "material": a.get("material", "-"),
             })
-        GEO_AI_CACHE.update({"fingerprint":fingerprint,"result":result,"time":now})
+        if not unresolved_ids:
+            GEO_AI_CACHE.update({"fingerprint":fingerprint,"result":result,"time":now})
+        else:
+            # Display this fresh partial result through GEO_CACHE for 5 minutes,
+            # but retry unresolved ids on the next Geo cycle.
+            result["status"] = f"PARTIAL CURRENT AI • {len(analyses)}/{len(candidates)} COVERAGE"
     except Exception as exc:
         previous = GEO_AI_CACHE.get("result")
         if previous:
             result = dict(previous)
-            result["status"] = "USING LAST AI RESULT"
+            result["status"] = "USING LAST COMPLETE/PARTIAL AI RESULT"
+            result["error"] = str(exc)[:500]
+            result["source_stats"] = source_stats
         else:
             result = {
                 "score":50.0,"regime":"AI TEMPORARILY UNAVAILABLE","events":[],"event_count":0,
@@ -4085,7 +3984,8 @@ def dashboard():
 <div class="panel" style="margin-top:12px;margin-bottom:12px">
 <div class="news-title">{{ data.geopolitical.regime }}</div>
 <div class="note" style="margin-top:5px"><strong>{{ data.geopolitical.gold_transmission_regime|default("Gold transmission pending") }}</strong></div>
-<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong>{% if data.geopolitical.ai_scale_normalized %} • Score scale: <strong>normalized 0-10 → 0-100</strong>{% endif %}</div>
+<div class="note">Status: <strong>{{ data.geopolitical.status }}</strong> • GDELT: <strong>{{ data.geopolitical.source_stats.gdelt|default(0) }}</strong> • Google News global: <strong>{{ data.geopolitical.source_stats.google_news|default(0) }}</strong> • Trump Truth: <strong>{{ data.geopolitical.source_stats.truth|default(0) }}</strong> • Trump X: <strong>{{ data.geopolitical.source_stats.x|default(0) }}</strong> • Uto: <strong>{{ data.geopolitical.source_stats.uto|default(0) }}</strong> • Candidates: <strong>{{ data.geopolitical.source_stats.candidates|default(0) }}</strong>{% if data.geopolitical.ai_analysis_count is defined %} • AI item analyses: <strong>{{ data.geopolitical.ai_analysis_count }}</strong> • AI missing: <strong>{{ data.geopolitical.ai_missing_count|default(0) }}</strong> • Material items: <strong>{{ data.geopolitical.material_item_count|default(0) }}</strong> • Model material: <strong>{{ data.geopolitical.model_material_count|default(0) }}</strong> • Semantic-rescued: <strong>{{ data.geopolitical.rescued_material_count|default(0) }}</strong>{% endif %} • AI coverage: <strong>{{ data.geopolitical.ai_analysis_count|default(0) }}/{{ data.geopolitical.candidate_count|default(data.geopolitical.source_stats.candidates|default(0)) }}</strong>{% if data.geopolitical.ai_unresolved_ids %} • Unresolved IDs: <strong>{{ data.geopolitical.ai_unresolved_ids|join(",") }}</strong>{% endif %} • Geo AI used: <strong>{{ data.geopolitical.ai_model|default("none") }}</strong>{% if data.geopolitical.ai_scale_normalized %} • Score scale: <strong>normalized 0-10 → 0-100</strong>{% endif %}</div>
+{% if data.geopolitical.ai_attempts is defined %}<div class="note">Geo AI recovery: <strong>{{ data.geopolitical.ai_analysis_count|default(0) }}/{{ data.geopolitical.source_stats.candidates|default(0) }}</strong> analyzed • Attempts: <strong>{{ data.geopolitical.ai_attempts }}</strong>{% if data.geopolitical.ai_unresolved_ids %} • Unresolved IDs: <strong>{{ data.geopolitical.ai_unresolved_ids|join(', ') }}</strong>{% endif %}</div>{% endif %}
 {% if data.geopolitical.gold_transmission %}
 <div class="note"><strong>Risk level does not determine gold direction.</strong> Attribution: <strong>{{ data.geopolitical.gold_transmission.attribution_status|default("UNCONFIRMED") }}</strong> • Potential pathways: <strong>{{ data.geopolitical.gold_transmission.potential_pathways|default("NONE") }}</strong> • Confirmed channels: <strong>{{ data.geopolitical.gold_transmission.confirmation_count|default(0) }}</strong></div>
 <div class="note">Gold transmission channels: USD <strong class="{% if data.geopolitical.gold_transmission.dollar_channel>0 %}positive{% elif data.geopolitical.gold_transmission.dollar_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.dollar_channel }}</strong> • Rates <strong class="{% if data.geopolitical.gold_transmission.rates_channel>0 %}positive{% elif data.geopolitical.gold_transmission.rates_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.rates_channel }}</strong> • Oil/Inflation <strong class="{% if data.geopolitical.gold_transmission.oil_channel>0 %}positive{% elif data.geopolitical.gold_transmission.oil_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.oil_channel }}</strong> • Risk-off/VIX <strong class="{% if data.geopolitical.gold_transmission.riskoff_channel>0 %}positive{% elif data.geopolitical.gold_transmission.riskoff_channel<0 %}negative{% endif %}">{{ data.geopolitical.gold_transmission.riskoff_channel }}</strong> • Confirmed-risk amplifier ×{{ data.geopolitical.gold_transmission.intensity }}</div>
